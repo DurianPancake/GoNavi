@@ -207,11 +207,15 @@ export function ImportLegacyGlobalProxy(arg1) {
 }
 
 export function InstallLocalDriverPackage(arg1, arg2, arg3, arg4) {
-    return window['go']['app']['App']['InstallLocalDriverPackage'](arg1, arg2, arg3, arg4);
+  return window['go']['app']['App']['InstallLocalDriverPackage'](arg1, arg2, arg3, arg4);
 }
 
 export function InstallUpdateAndRestart() {
   return window['go']['app']['App']['InstallUpdateAndRestart']();
+}
+
+export function LogWindowDiagnostic(arg1, arg2) {
+  return window['go']['app']['App']['LogWindowDiagnostic'](arg1, arg2);
 }
 
 export function MongoDiscoverMembers(arg1) {
