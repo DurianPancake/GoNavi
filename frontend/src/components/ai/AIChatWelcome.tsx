@@ -1,6 +1,7 @@
 import React from 'react';
-import { RobotOutlined } from '@ant-design/icons';
+import { ApiOutlined, DatabaseOutlined, FileTextOutlined, RobotOutlined, ThunderboltOutlined } from '@ant-design/icons';
 import type { OverlayWorkbenchTheme } from '../../utils/overlayWorkbenchTheme';
+import { useI18n } from '../../i18n/provider';
 
 interface AIChatWelcomeProps {
     overlayTheme: OverlayWorkbenchTheme;
@@ -10,44 +11,105 @@ interface AIChatWelcomeProps {
     mutedColor: string;
     onQuickAction: (prompt: string, autoSend?: boolean) => void;
     contextTableNames?: string[];
+    isV2Ui?: boolean;
 }
 
 export const AIChatWelcome: React.FC<AIChatWelcomeProps> = ({
-    overlayTheme, quickActionBg, quickActionBorder, textColor, mutedColor, onQuickAction, contextTableNames = []
+    overlayTheme, quickActionBg, quickActionBorder, textColor, mutedColor, onQuickAction, contextTableNames = [], isV2Ui = false
 }) => {
+    const { t } = useI18n();
     const hasContext = contextTableNames.length > 0;
-    const tableList = contextTableNames.join('、');
+    const tableList = contextTableNames.join(t('ai_chat.quick_action.table_separator'));
+    const legacyQuickActions = hasContext
+        ? [
+            { label: t('ai_chat.quick_action.generate_sql'), prompt: t('ai_chat.quick_action.generate_sql.prompt.with_context', { tables: tableList }) },
+            { label: t('ai_chat.quick_action.explain_schema'), prompt: t('ai_chat.quick_action.explain_schema.prompt.with_context', { tables: tableList }) },
+            { label: t('ai_chat.quick_action.optimize'), prompt: t('ai_chat.quick_action.optimize.prompt.with_context', { tables: tableList }) },
+            { label: t('ai_chat.quick_action.schema_analysis'), prompt: t('ai_chat.quick_action.schema_analysis.prompt.with_context', { tables: tableList }) },
+        ]
+        : [
+            { label: t('ai_chat.quick_action.generate_sql'), prompt: t('ai_chat.quick_action.generate_sql.prompt.default') },
+            { label: t('ai_chat.quick_action.explain_sql'), prompt: t('ai_chat.quick_action.explain_sql.prompt.default') },
+            { label: t('ai_chat.quick_action.optimize'), prompt: t('ai_chat.quick_action.optimize.prompt.default') },
+            { label: t('ai_chat.quick_action.schema_analysis'), prompt: t('ai_chat.quick_action.schema_analysis.prompt.default') },
+        ];
 
     const quickActions = hasContext
         ? [
-            { label: '📝 生成 SQL', prompt: `请根据以下表结构生成一条常用查询语句：${tableList}` },
-            { label: '🔍 解释表结构', prompt: `请详细解释以下表的设计意图和字段含义：${tableList}` },
-            { label: '⚡ 优化建议', prompt: `请分析以下表的结构设计，给出索引优化和查询性能优化建议：${tableList}` },
-            { label: '🏗️ Schema 分析', prompt: `请对以下表进行全面的 Schema 分析，包括数据类型选择、范式评估和改进建议：${tableList}` },
+            { label: t('ai_chat.quick_action.generate_sql.title'), hint: t('ai_chat.quick_action.generate_sql.hint.with_context'), icon: <FileTextOutlined />, tone: 'info', prompt: t('ai_chat.quick_action.generate_sql.prompt.with_context', { tables: tableList }) },
+            { label: t('ai_chat.quick_action.explain_schema.title'), hint: t('ai_chat.quick_action.explain_schema.hint.with_context'), icon: <DatabaseOutlined />, tone: 'success', prompt: t('ai_chat.quick_action.explain_schema.prompt.with_context', { tables: tableList }) },
+            { label: t('ai_chat.quick_action.optimize.title'), hint: t('ai_chat.quick_action.optimize.hint.with_context'), icon: <ThunderboltOutlined />, tone: 'warn', prompt: t('ai_chat.quick_action.optimize.prompt.with_context', { tables: tableList }) },
+            { label: t('ai_chat.quick_action.schema_analysis.title'), hint: t('ai_chat.quick_action.schema_analysis.hint.with_context'), icon: <ApiOutlined />, tone: 'purple', prompt: t('ai_chat.quick_action.schema_analysis.prompt.with_context', { tables: tableList }) },
         ]
         : [
-            { label: '📝 生成 SQL', prompt: '请根据当前数据库表结构生成一条查询语句：' },
-            { label: '🔍 解释 SQL', prompt: '请解释以下 SQL 语句的执行逻辑：\n```sql\n\n```' },
-            { label: '⚡ 优化建议', prompt: '请分析以下 SQL 语句的性能并给出优化建议：\n```sql\n\n```' },
-            { label: '🏗️ Schema 分析', prompt: '请分析当前数据库的表结构并给出优化建议。' },
+            { label: t('ai_chat.quick_action.generate_sql.title'), hint: t('ai_chat.quick_action.generate_sql.hint.default'), icon: <FileTextOutlined />, tone: 'info', prompt: t('ai_chat.quick_action.generate_sql.prompt.default') },
+            { label: t('ai_chat.quick_action.explain_sql.title'), hint: t('ai_chat.quick_action.explain_sql.hint.default'), icon: <DatabaseOutlined />, tone: 'success', prompt: t('ai_chat.quick_action.explain_sql.prompt.default') },
+            { label: t('ai_chat.quick_action.optimize.title'), hint: t('ai_chat.quick_action.optimize.hint.default'), icon: <ThunderboltOutlined />, tone: 'warn', prompt: t('ai_chat.quick_action.optimize.prompt.default') },
+            { label: t('ai_chat.quick_action.schema_analysis.title'), hint: t('ai_chat.quick_action.schema_analysis.hint.default'), icon: <ApiOutlined />, tone: 'purple', prompt: t('ai_chat.quick_action.schema_analysis.prompt.default') },
         ];
+    const promptSuggestions = hasContext
+        ? [
+            t('ai_chat.welcome.suggestion.low_rows.with_context', { table: contextTableNames[0] || '' }),
+            t('ai_chat.welcome.suggestion.channel_distribution.with_context'),
+            t('ai_chat.welcome.suggestion.cleanup.with_context'),
+        ]
+        : [
+            t('ai_chat.welcome.suggestion.low_rows.default'),
+            t('ai_chat.welcome.suggestion.channel_distribution.default'),
+            t('ai_chat.welcome.suggestion.cleanup.default'),
+        ];
+
+    if (!isV2Ui) {
+        return (
+            <div className="ai-chat-welcome" style={{ padding: '30px 20px', alignItems: 'flex-start', textAlign: 'left' }}>
+                <div style={{ color: overlayTheme.titleText, fontSize: 16, fontWeight: 600, marginBottom: 8 }}>
+                    <RobotOutlined style={{ marginRight: 8, color: overlayTheme.iconColor }} />
+                    {t('ai_chat.welcome.title')}
+                </div>
+                <div className="welcome-desc" style={{ color: mutedColor, fontSize: 13, lineHeight: 1.6, marginBottom: 20 }}>
+                    {hasContext
+                        ? t('ai_chat.welcome.description.with_context', { count: contextTableNames.length })
+                        : t('ai_chat.welcome.description.default')}
+                </div>
+                <div className="quick-actions">
+                    {legacyQuickActions.map(action => (
+                        <div
+                            key={action.label}
+                            className="quick-action-btn"
+                            style={{
+                                background: quickActionBg,
+                                borderColor: quickActionBorder,
+                                color: textColor,
+                            }}
+                            onClick={() => onQuickAction(action.prompt)}
+                        >
+                            {action.label}
+                        </div>
+                    ))}
+                </div>
+            </div>
+        );
+    }
 
     return (
         <div className="ai-chat-welcome" style={{ padding: '30px 20px', alignItems: 'flex-start', textAlign: 'left' }}>
-            <div style={{ color: overlayTheme.titleText, fontSize: 16, fontWeight: 600, marginBottom: 8 }}>
-                <RobotOutlined style={{ marginRight: 8, color: overlayTheme.iconColor }} />
-                你好，我是 GoNavi AI
+            <div className="gn-v2-ai-welcome-title" style={{ color: overlayTheme.titleText, fontSize: 16, fontWeight: 600, marginBottom: 8 }}>
+                <span className="gn-v2-ai-welcome-icon">
+                    <RobotOutlined style={{ color: overlayTheme.iconColor }} />
+                </span>
+                <strong>{t('ai_chat.welcome.title')}</strong>
             </div>
             <div className="welcome-desc" style={{ color: mutedColor, fontSize: 13, lineHeight: 1.6, marginBottom: 20 }}>
-                {hasContext 
-                    ? `已自动关联 ${contextTableNames.length} 张表结构，点击下方按钮快速开始分析。`
-                    : '我是你的智能数据库助手。我可以帮你生成 SQL 查询、分析表结构、解释执行逻辑以及优化数据库性能。'}
+                {hasContext
+                    ? t('ai_chat.welcome.description.with_context', { count: contextTableNames.length })
+                    : t('ai_chat.welcome.description.default')}
             </div>
-            <div className="quick-actions">
+            <div className="quick-actions gn-v2-ai-quick-grid">
                 {quickActions.map(action => (
-                    <div
+                    <button
+                        type="button"
                         key={action.label}
-                        className="quick-action-btn"
+                        className={`quick-action-btn gn-v2-ai-quick-card tone-${action.tone}`}
                         style={{
                             background: quickActionBg,
                             borderColor: quickActionBorder,
@@ -55,8 +117,23 @@ export const AIChatWelcome: React.FC<AIChatWelcomeProps> = ({
                         }}
                         onClick={() => onQuickAction(action.prompt)}
                     >
-                        {action.label}
-                    </div>
+                        <span className="gn-v2-ai-quick-icon">{action.icon}</span>
+                        <strong>{action.label}</strong>
+                        <span>{action.hint}</span>
+                    </button>
+                ))}
+            </div>
+            <div className="gn-v2-ai-suggestion-list">
+                <div className="gn-v2-ai-suggestion-divider">
+                    <span />
+                    <small>{t('ai_chat.welcome.suggestion.divider')}</small>
+                    <span />
+                </div>
+                {promptSuggestions.map((prompt) => (
+                    <button key={prompt} type="button" onClick={() => onQuickAction(prompt)}>
+                        <RobotOutlined />
+                        <span>{prompt}</span>
+                    </button>
                 ))}
             </div>
         </div>

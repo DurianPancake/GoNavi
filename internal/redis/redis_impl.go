@@ -5,8 +5,11 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"math"
+	"math/big"
 	"net"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,6 +37,8 @@ type RedisClientImpl struct {
 }
 
 const (
+	redisDefaultDatabaseCount         = 16
+	redisClusterLogicalDBCount        = 16
 	redisScanDefaultTargetCount int64 = 2000
 	redisScanMaxTargetCount     int64 = 10000
 	redisScanMinStepCount       int64 = 200
@@ -45,6 +50,10 @@ const (
 	redisSearchMaxRounds              = 16
 	redisSearchMaxDuration            = 3 * time.Second
 )
+
+var redisDBSwitchConnect = func(client *RedisClientImpl, config connection.ConnectionConfig) error {
+	return client.Connect(config)
+}
 
 // NewRedisClient creates a new Redis client instance
 func NewRedisClient() RedisClient {
@@ -61,11 +70,19 @@ func normalizeRedisTimeout(timeoutSeconds int) time.Duration {
 func normalizeRedisSeedAddress(raw string, defaultPort int) (string, error) {
 	addr := strings.TrimSpace(raw)
 	if addr == "" {
-		return "", fmt.Errorf("Redis 节点地址不能为空")
+		return "", localizedRedisBackendError("redis.backend.error.node_address_required", nil)
 	}
 
-	if _, _, err := net.SplitHostPort(addr); err == nil {
-		return addr, nil
+	if host, port, err := net.SplitHostPort(addr); err == nil {
+		host = strings.TrimSpace(host)
+		port = strings.TrimSpace(port)
+		if host == "" {
+			return "", localizedRedisBackendError("redis.backend.error.invalid_node_address", map[string]any{"address": addr})
+		}
+		if _, err := strconv.Atoi(port); err != nil {
+			return "", localizedRedisBackendError("redis.backend.error.invalid_port", map[string]any{"address": addr})
+		}
+		return net.JoinHostPort(host, port), nil
 	}
 
 	if !strings.Contains(addr, ":") {
@@ -75,15 +92,15 @@ func normalizeRedisSeedAddress(raw string, defaultPort int) (string, error) {
 	// 尝试兼容 host:port 但端口格式异常的场景。
 	host, port, ok := strings.Cut(addr, ":")
 	if !ok {
-		return "", fmt.Errorf("无效 Redis 节点地址: %s", addr)
+		return "", localizedRedisBackendError("redis.backend.error.invalid_node_address", map[string]any{"address": addr})
 	}
 	host = strings.TrimSpace(host)
 	port = strings.TrimSpace(port)
 	if host == "" {
-		return "", fmt.Errorf("无效 Redis 节点地址: %s", addr)
+		return "", localizedRedisBackendError("redis.backend.error.invalid_node_address", map[string]any{"address": addr})
 	}
 	if _, err := strconv.Atoi(port); err != nil {
-		return "", fmt.Errorf("无效 Redis 端口: %s", addr)
+		return "", localizedRedisBackendError("redis.backend.error.invalid_port", map[string]any{"address": addr})
 	}
 	return net.JoinHostPort(host, port), nil
 }
@@ -114,9 +131,31 @@ func buildRedisSeedAddrs(config connection.ConnectionConfig) ([]string, error) {
 		addrs = append(addrs, normalized)
 	}
 	if len(addrs) == 0 {
-		return nil, fmt.Errorf("Redis 连接地址不能为空")
+		return nil, localizedRedisBackendError("redis.backend.error.address_required", nil)
 	}
 	return addrs, nil
+}
+
+func redisTopologyDisplayName(topology string) string {
+	switch strings.ToLower(strings.TrimSpace(topology)) {
+	case "sentinel":
+		return localizedRedisBackendText("redis.backend.label.topology_sentinel", nil)
+	case "cluster":
+		return localizedRedisBackendText("redis.backend.label.topology_cluster", nil)
+	default:
+		return localizedRedisBackendText("redis.backend.label.topology_multi_node", nil)
+	}
+}
+
+func redisConnectAttemptFailureMessage(key string, attempt int, detail any) string {
+	return localizedRedisBackendText(key, map[string]any{
+		"attempt": attempt,
+		"detail":  strings.TrimSpace(fmt.Sprint(detail)),
+	})
+}
+
+func joinRedisFailures(failures []string) string {
+	return strings.Join(failures, "; ")
 }
 
 func (r *RedisClientImpl) redisNamespacePrefixForDB(index int) string {
@@ -153,6 +192,46 @@ func (r *RedisClientImpl) toPhysicalPattern(pattern string) string {
 		return normalized
 	}
 	return prefix + normalized
+}
+
+func redisGlobPatternLiteralKey(pattern string) (string, bool) {
+	if pattern == "" {
+		return "", false
+	}
+
+	var builder strings.Builder
+	for i := 0; i < len(pattern); i++ {
+		char := pattern[i]
+		if char == '\\' {
+			if i+1 >= len(pattern) {
+				return "", false
+			}
+			i++
+			builder.WriteByte(pattern[i])
+			continue
+		}
+		if char == '*' || char == '?' || char == '[' {
+			return "", false
+		}
+		builder.WriteByte(char)
+	}
+	return builder.String(), true
+}
+
+func escapeRedisGlobLiteral(value string) string {
+	var builder strings.Builder
+	for i := 0; i < len(value); i++ {
+		char := value[i]
+		if char == '*' || char == '?' || char == '[' || char == ']' || char == '\\' {
+			builder.WriteByte('\\')
+		}
+		builder.WriteByte(char)
+	}
+	return builder.String()
+}
+
+func redisExactSearchPattern(literalKey string) (string, string) {
+	return literalKey, escapeRedisGlobLiteral(literalKey) + ":*"
 }
 
 func (r *RedisClientImpl) toPhysicalKeys(keys []string) []string {
@@ -203,11 +282,11 @@ func sanitizeRedisPassword(password string) string {
 // Connect establishes a connection to Redis
 func (r *RedisClientImpl) Connect(config connection.ConnectionConfig) error {
 	config.Password = sanitizeRedisPassword(config.Password)
+	config.RedisSentinelPassword = sanitizeRedisPassword(config.RedisSentinelPassword)
 	r.config = config
-	if r.config.RedisDB < 0 || r.config.RedisDB > 15 {
+	if r.config.RedisDB < 0 {
 		r.config.RedisDB = 0
 	}
-	r.currentDB = r.config.RedisDB
 	r.forwarder = nil
 	r.client = nil
 	r.singleClient = nil
@@ -221,13 +300,78 @@ func (r *RedisClientImpl) Connect(config connection.ConnectionConfig) error {
 	r.seedAddrs = append([]string(nil), seedAddrs...)
 
 	topology := strings.ToLower(strings.TrimSpace(config.Topology))
-	r.isCluster = topology == "cluster" || len(seedAddrs) > 1
+	isSentinel := topology == "sentinel"
+	r.isCluster = !isSentinel && (topology == "cluster" || len(seedAddrs) > 1)
+	if r.isCluster && r.config.RedisDB >= redisClusterLogicalDBCount {
+		r.config.RedisDB = 0
+	}
+	r.currentDB = r.config.RedisDB
 
-	if r.isCluster && config.UseSSH {
-		return fmt.Errorf("Redis 集群模式暂不支持 SSH 隧道，请关闭 SSH 后重试")
+	if (r.isCluster || isSentinel) && config.UseSSH {
+		return localizedRedisBackendError("redis.backend.error.topology_ssh_tunnel_unsupported", map[string]any{
+			"topology": redisTopologyDisplayName(topology),
+		})
 	}
 
 	timeout := normalizeRedisTimeout(config.Timeout)
+	if isSentinel {
+		masterName := strings.TrimSpace(config.RedisSentinelMaster)
+		if masterName == "" {
+			return localizedRedisBackendError("redis.backend.error.sentinel_master_required", nil)
+		}
+		attempts := []connection.ConnectionConfig{config}
+		if shouldTryRedisSSLPreferredFallback(config) {
+			attempts = append(attempts, withRedisSSLDisabled(config))
+		}
+
+		var failures []string
+		for idx, attempt := range attempts {
+			var tlsConfig *tls.Config
+			if cfg, err := resolveRedisTLSConfig(attempt); err != nil {
+				failures = append(failures, redisConnectAttemptFailureMessage("redis.backend.error.connect_tls_setup_failed", idx+1, err))
+				continue
+			} else if cfg != nil {
+				if host, _, err := net.SplitHostPort(seedAddrs[0]); err == nil && host != "" {
+					cfg.ServerName = host
+				}
+				tlsConfig = cfg
+			}
+			opts := &redis.FailoverOptions{
+				MasterName:       masterName,
+				SentinelAddrs:    seedAddrs,
+				Username:         strings.TrimSpace(attempt.User),
+				Password:         attempt.Password,
+				SentinelUsername: strings.TrimSpace(attempt.RedisSentinelUser),
+				SentinelPassword: attempt.RedisSentinelPassword,
+				DB:               r.currentDB,
+				DialTimeout:      timeout,
+				ReadTimeout:      timeout,
+				WriteTimeout:     timeout,
+				TLSConfig:        tlsConfig,
+			}
+			sentinelClient := redis.NewFailoverClient(opts)
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			pingErr := sentinelClient.Ping(ctx).Err()
+			cancel()
+			if pingErr != nil {
+				sentinelClient.Close()
+				failures = append(failures, redisConnectAttemptFailureMessage("redis.backend.error.connect_attempt_failed", idx+1, pingErr))
+				continue
+			}
+			r.client = sentinelClient
+			r.singleClient = sentinelClient
+			r.config = attempt
+			if idx > 0 {
+				logger.Warnf("Redis Sentinel SSL 优先连接失败，已回退至明文连接")
+			}
+			logger.Infof("Redis Sentinel 连接成功: sentinels=%s master=%s DB=%d", strings.Join(seedAddrs, ","), masterName, r.currentDB)
+			return nil
+		}
+		return localizedRedisBackendError("redis.backend.error.sentinel_connect_failed", map[string]any{
+			"detail": joinRedisFailures(failures),
+		})
+	}
+
 	if r.isCluster {
 		attempts := []connection.ConnectionConfig{config}
 		if shouldTryRedisSSLPreferredFallback(config) {
@@ -237,7 +381,10 @@ func (r *RedisClientImpl) Connect(config connection.ConnectionConfig) error {
 		var failures []string
 		for idx, attempt := range attempts {
 			var tlsConfig *tls.Config
-			if cfg := resolveRedisTLSConfig(attempt); cfg != nil {
+			if cfg, err := resolveRedisTLSConfig(attempt); err != nil {
+				failures = append(failures, redisConnectAttemptFailureMessage("redis.backend.error.connect_tls_setup_failed", idx+1, err))
+				continue
+			} else if cfg != nil {
 				if host, _, err := net.SplitHostPort(seedAddrs[0]); err == nil && host != "" {
 					cfg.ServerName = host
 				}
@@ -258,7 +405,7 @@ func (r *RedisClientImpl) Connect(config connection.ConnectionConfig) error {
 			cancel()
 			if pingErr != nil {
 				clusterClient.Close()
-				failures = append(failures, fmt.Sprintf("第%d次连接失败: %v", idx+1, pingErr))
+				failures = append(failures, redisConnectAttemptFailureMessage("redis.backend.error.connect_attempt_failed", idx+1, pingErr))
 				continue
 			}
 			r.client = clusterClient
@@ -270,14 +417,18 @@ func (r *RedisClientImpl) Connect(config connection.ConnectionConfig) error {
 			logger.Infof("Redis 集群连接成功: seeds=%s 逻辑库=db%d", strings.Join(seedAddrs, ","), r.currentDB)
 			return nil
 		}
-		return fmt.Errorf("Redis 集群连接失败: %s", strings.Join(failures, "；"))
+		return localizedRedisBackendError("redis.backend.error.cluster_connect_failed", map[string]any{
+			"detail": joinRedisFailures(failures),
+		})
 	}
 
 	addr := seedAddrs[0]
 	if config.UseSSH {
 		forwarder, err := ssh.GetOrCreateLocalForwarder(config.SSH, config.Host, config.Port)
 		if err != nil {
-			return fmt.Errorf("创建 SSH 隧道失败: %w", err)
+			return localizedRedisBackendError("redis.backend.error.ssh_tunnel_create_failed", map[string]any{
+				"detail": err.Error(),
+			})
 		}
 		r.forwarder = forwarder
 		addr = forwarder.LocalAddr
@@ -292,7 +443,10 @@ func (r *RedisClientImpl) Connect(config connection.ConnectionConfig) error {
 	var failures []string
 	for idx, attempt := range attempts {
 		var tlsConfig *tls.Config
-		if cfg := resolveRedisTLSConfig(attempt); cfg != nil {
+		if cfg, err := resolveRedisTLSConfig(attempt); err != nil {
+			failures = append(failures, redisConnectAttemptFailureMessage("redis.backend.error.connect_tls_setup_failed", idx+1, err))
+			continue
+		} else if cfg != nil {
 			if host, _, err := net.SplitHostPort(addr); err == nil && host != "" {
 				cfg.ServerName = host
 			}
@@ -316,7 +470,7 @@ func (r *RedisClientImpl) Connect(config connection.ConnectionConfig) error {
 		cancel()
 		if pingErr != nil {
 			singleClient.Close()
-			failures = append(failures, fmt.Sprintf("第%d次连接失败: %v", idx+1, pingErr))
+			failures = append(failures, redisConnectAttemptFailureMessage("redis.backend.error.connect_attempt_failed", idx+1, pingErr))
 			continue
 		}
 
@@ -330,7 +484,9 @@ func (r *RedisClientImpl) Connect(config connection.ConnectionConfig) error {
 		return nil
 	}
 
-	return fmt.Errorf("Redis 连接失败: %s", strings.Join(failures, "；"))
+	return localizedRedisBackendError("redis.backend.error.connect_failed", map[string]any{
+		"detail": joinRedisFailures(failures),
+	})
 }
 
 // Close closes the Redis connection
@@ -367,6 +523,15 @@ func (r *RedisClientImpl) ScanKeys(pattern string, cursor uint64, count int64) (
 	if pattern == "" {
 		pattern = "*"
 	}
+	exactPhysicalKey := ""
+	if literalKey, ok := redisGlobPatternLiteralKey(pattern); ok {
+		exactKey, namespacePattern := redisExactSearchPattern(literalKey)
+		exactPhysicalKey = r.toPhysicalKey(exactKey)
+		if exactPhysicalKey == "" {
+			return &RedisScanResult{Keys: []RedisKeyInfo{}, Cursor: "0"}, nil
+		}
+		pattern = namespacePattern
+	}
 	physicalPattern := r.toPhysicalPattern(pattern)
 
 	isSearchPattern := pattern != "*"
@@ -393,6 +558,10 @@ func (r *RedisClientImpl) ScanKeys(pattern string, cursor uint64, count int64) (
 		keys := make([]string, 0, int(targetCount))
 		seen := make(map[string]struct{}, int(targetCount))
 		var mu sync.Mutex
+		if exactPhysicalKey != "" {
+			keys = append(keys, exactPhysicalKey)
+			seen[exactPhysicalKey] = struct{}{}
+		}
 
 		err := r.clusterClient.ForEachMaster(ctx, func(nodeCtx context.Context, node *redis.Client) error {
 			var nodeCursor uint64
@@ -453,6 +622,10 @@ func (r *RedisClientImpl) ScanKeys(pattern string, cursor uint64, count int64) (
 
 	keys := make([]string, 0, int(targetCount))
 	seen := make(map[string]struct{}, int(targetCount))
+	if exactPhysicalKey != "" && currentCursor == 0 {
+		keys = append(keys, exactPhysicalKey)
+		seen[exactPhysicalKey] = struct{}{}
+	}
 
 	for len(keys) < int(targetCount) {
 		if time.Since(scanStartedAt) >= maxDuration {
@@ -699,12 +872,12 @@ func (r *RedisClientImpl) GetValue(key string) (*RedisValue, error) {
 		result.Length = int64(len(val))
 
 	case "hash":
-		val, err := r.client.HGetAll(ctx, physicalKey).Result()
+		val, length, err := r.readHashEntries(ctx, physicalKey)
 		if err != nil {
 			return nil, err
 		}
 		result.Value = val
-		result.Length = int64(len(val))
+		result.Length = length
 
 	case "list":
 		length, err := r.client.LLen(ctx, physicalKey).Result()
@@ -819,7 +992,74 @@ func (r *RedisClientImpl) GetHash(key string) (map[string]string, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	return r.client.HGetAll(ctx, r.toPhysicalKey(key)).Result()
+	values, _, err := r.readHashEntries(ctx, r.toPhysicalKey(key))
+	return values, err
+}
+
+func (r *RedisClientImpl) readHashEntries(ctx context.Context, physicalKey string) (map[string]string, int64, error) {
+	return readRedisHashEntriesWithFallback(
+		func() (map[string]string, error) {
+			return r.client.HGetAll(ctx, physicalKey).Result()
+		},
+		func() (int64, error) {
+			return r.client.HLen(ctx, physicalKey).Result()
+		},
+		func(cursor uint64, count int64) ([]string, uint64, error) {
+			return r.client.HScan(ctx, physicalKey, cursor, "*", count).Result()
+		},
+	)
+}
+
+func readRedisHashEntriesWithFallback(
+	readAll func() (map[string]string, error),
+	readLength func() (int64, error),
+	scan func(cursor uint64, count int64) ([]string, uint64, error),
+) (map[string]string, int64, error) {
+	values, err := readAll()
+	if err == nil {
+		return values, int64(len(values)), nil
+	}
+	if !shouldFallbackRedisHashScan(err) {
+		return nil, 0, err
+	}
+
+	entries := make(map[string]string)
+	var cursor uint64
+	for round := 0; round < redisScanMaxRounds; round++ {
+		pairs, nextCursor, scanErr := scan(cursor, redisScanMinStepCount)
+		if scanErr != nil {
+			return nil, 0, scanErr
+		}
+		if len(pairs)%2 != 0 {
+			return nil, 0, fmt.Errorf("Redis HSCAN 返回结果格式异常")
+		}
+		for i := 0; i < len(pairs); i += 2 {
+			entries[pairs[i]] = pairs[i+1]
+		}
+		cursor = nextCursor
+		if cursor == 0 {
+			length, lengthErr := readLength()
+			if lengthErr == nil {
+				return entries, length, nil
+			}
+			return entries, int64(len(entries)), nil
+		}
+	}
+
+	return nil, 0, fmt.Errorf("Redis HSCAN 超出安全轮次，无法完整读取 hash")
+}
+
+func shouldFallbackRedisHashScan(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	if !strings.Contains(message, "hgetall") {
+		return false
+	}
+	return strings.Contains(message, "not support for normal user") ||
+		strings.Contains(message, "noperm") ||
+		strings.Contains(message, "permission")
 }
 
 // SetHashField sets a field in a hash
@@ -1137,14 +1377,18 @@ func (r *RedisClientImpl) ExecuteCommand(args []string) (interface{}, error) {
 		switch command {
 		case "SELECT":
 			if len(args) < 2 {
-				return nil, fmt.Errorf("SELECT 命令缺少数据库索引")
+				return nil, localizedRedisBackendError("redis.backend.error.select_db_index_required", nil)
 			}
-			index, err := strconv.Atoi(strings.TrimSpace(args[1]))
+			rawIndex := strings.TrimSpace(args[1])
+			index, err := strconv.Atoi(rawIndex)
 			if err != nil {
-				return nil, fmt.Errorf("无效数据库索引: %s", args[1])
+				return nil, localizedRedisBackendError("redis.backend.error.select_db_index_invalid", map[string]any{"value": rawIndex})
 			}
-			if index < 0 || index > 15 {
-				return nil, fmt.Errorf("数据库索引必须在 0-15 之间")
+			if index < 0 || index >= redisClusterLogicalDBCount {
+				return nil, localizedRedisBackendError("redis.backend.error.select_db_index_out_of_range", map[string]any{
+					"min": 0,
+					"max": redisClusterLogicalDBCount - 1,
+				})
 			}
 			r.currentDB = index
 			r.config.RedisDB = index
@@ -1173,7 +1417,16 @@ func (r *RedisClientImpl) ExecuteCommand(args []string) (interface{}, error) {
 	return formatCommandResult(result), nil
 }
 
-// formatCommandResult formats the command result for display
+// formatCommandResult formats the command result for display.
+//
+// RESP3 协议（go-redis v9 默认）下，HGETALL / CONFIG GET / XINFO 等命令返回 Map 类型，
+// go-redis 用 map[interface{}]interface{} 承载。encoding/json 不支持非 string-key 的 map，
+// 如果让原值穿透到 Wails RPC，json.Marshal 会失败，Wails runtime 在 Windows 上会直接 panic
+// 让进程退出——用户感知为 GoNavi 闪退（issue: HGETALL 闪退）。
+// 平展成 [k1, v1, k2, v2, ...] 交错形式与 RESP2 array 输出一致，前端按 array 渲染。
+//
+// 这里同时把 RESP3 的 NaN/Inf 浮点、大整数、error 以及其他 map/slice 形态统一收敛为
+// JSON-safe 结构，避免 Redis 命令面板再把不可序列化的值透传给 Wails。
 func formatCommandResult(result interface{}) interface{} {
 	switch v := result.(type) {
 	case []interface{}:
@@ -1182,10 +1435,74 @@ func formatCommandResult(result interface{}) interface{} {
 			formatted[i] = formatCommandResult(item)
 		}
 		return formatted
+	case map[interface{}]interface{}:
+		flattened := make([]interface{}, 0, len(v)*2)
+		for key, val := range v {
+			flattened = append(flattened, formatCommandResult(key))
+			flattened = append(flattened, formatCommandResult(val))
+		}
+		return flattened
+	case map[string]interface{}:
+		formatted := make(map[string]interface{}, len(v))
+		for key, val := range v {
+			formatted[key] = formatCommandResult(val)
+		}
+		return formatted
 	case []byte:
 		return string(v)
-	default:
+	case error:
+		return v.Error()
+	case *big.Int:
+		if v == nil {
+			return nil
+		}
+		return v.String()
+	case float64:
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return fmt.Sprint(v)
+		}
 		return v
+	case float32:
+		f := float64(v)
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return fmt.Sprint(v)
+		}
+		return v
+	default:
+		return formatCommandResultByReflection(v)
+	}
+}
+
+func formatCommandResultByReflection(result interface{}) interface{} {
+	value := reflect.ValueOf(result)
+	if !value.IsValid() {
+		return nil
+	}
+	switch value.Kind() {
+	case reflect.Map:
+		if value.Type().Key().Kind() == reflect.String {
+			formatted := make(map[string]interface{}, value.Len())
+			iter := value.MapRange()
+			for iter.Next() {
+				formatted[iter.Key().String()] = formatCommandResult(iter.Value().Interface())
+			}
+			return formatted
+		}
+		flattened := make([]interface{}, 0, value.Len()*2)
+		iter := value.MapRange()
+		for iter.Next() {
+			flattened = append(flattened, formatCommandResult(iter.Key().Interface()))
+			flattened = append(flattened, formatCommandResult(iter.Value().Interface()))
+		}
+		return flattened
+	case reflect.Slice, reflect.Array:
+		formatted := make([]interface{}, value.Len())
+		for i := 0; i < value.Len(); i++ {
+			formatted[i] = formatCommandResult(value.Index(i).Interface())
+		}
+		return formatted
+	default:
+		return result
 	}
 }
 
@@ -1217,6 +1534,67 @@ func (r *RedisClientImpl) GetServerInfo() (map[string]string, error) {
 	return result, nil
 }
 
+func parseRedisKeyspaceDatabaseKeys(info string) map[int]int64 {
+	dbMap := make(map[int]int64)
+	lines := strings.Split(info, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "db") {
+			// Format: db0:keys=123,expires=0,avg_ttl=0
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			dbIndex, err := strconv.Atoi(strings.TrimPrefix(parts[0], "db"))
+			if err != nil {
+				continue
+			}
+			kvPairs := strings.Split(parts[1], ",")
+			for _, kv := range kvPairs {
+				if strings.HasPrefix(kv, "keys=") {
+					keys, _ := strconv.ParseInt(strings.TrimPrefix(kv, "keys="), 10, 64)
+					dbMap[dbIndex] = keys
+					break
+				}
+			}
+		}
+	}
+	return dbMap
+}
+
+func parseRedisConfiguredDatabaseCount(config map[string]string) (int, bool) {
+	for key, value := range config {
+		if !strings.EqualFold(strings.TrimSpace(key), "databases") {
+			continue
+		}
+		count, err := strconv.Atoi(strings.TrimSpace(value))
+		if err == nil && count > 0 {
+			return count, true
+		}
+	}
+	return 0, false
+}
+
+func (r *RedisClientImpl) resolveRedisDatabaseCount(ctx context.Context, dbMap map[int]int64) int {
+	count := redisDefaultDatabaseCount
+	if r.currentDB >= count {
+		count = r.currentDB + 1
+	}
+	for index := range dbMap {
+		if index >= count {
+			count = index + 1
+		}
+	}
+	config, err := r.client.ConfigGet(ctx, "databases").Result()
+	if err != nil {
+		return count
+	}
+	if configured, ok := parseRedisConfiguredDatabaseCount(config); ok && configured > count {
+		count = configured
+	}
+	return count
+}
+
 // GetDatabases returns information about all databases
 func (r *RedisClientImpl) GetDatabases() ([]RedisDBInfo, error) {
 	if r.client == nil {
@@ -1242,8 +1620,8 @@ func (r *RedisClientImpl) GetDatabases() ([]RedisDBInfo, error) {
 			logger.Warnf("Redis 集群获取 key 数量失败，回退为 0: %v", err)
 			totalKeys = 0
 		}
-		result := make([]RedisDBInfo, 16)
-		for i := 0; i < 16; i++ {
+		result := make([]RedisDBInfo, redisClusterLogicalDBCount)
+		for i := 0; i < redisClusterLogicalDBCount; i++ {
 			result[i] = RedisDBInfo{Index: i, Keys: 0}
 		}
 		result[0].Keys = totalKeys
@@ -1256,36 +1634,10 @@ func (r *RedisClientImpl) GetDatabases() ([]RedisDBInfo, error) {
 		return nil, err
 	}
 
-	// Parse keyspace info
-	dbMap := make(map[int]int64)
-	lines := strings.Split(info, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "db") {
-			// Format: db0:keys=123,expires=0,avg_ttl=0
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) != 2 {
-				continue
-			}
-			dbIndex, err := strconv.Atoi(strings.TrimPrefix(parts[0], "db"))
-			if err != nil {
-				continue
-			}
-			// Parse keys count
-			kvPairs := strings.Split(parts[1], ",")
-			for _, kv := range kvPairs {
-				if strings.HasPrefix(kv, "keys=") {
-					keys, _ := strconv.ParseInt(strings.TrimPrefix(kv, "keys="), 10, 64)
-					dbMap[dbIndex] = keys
-					break
-				}
-			}
-		}
-	}
-
-	// Return all 16 databases (0-15)
-	result := make([]RedisDBInfo, 16)
-	for i := 0; i < 16; i++ {
+	dbMap := parseRedisKeyspaceDatabaseKeys(info)
+	databaseCount := r.resolveRedisDatabaseCount(ctx, dbMap)
+	result := make([]RedisDBInfo, databaseCount)
+	for i := 0; i < databaseCount; i++ {
 		result[i] = RedisDBInfo{
 			Index: i,
 			Keys:  dbMap[i], // Will be 0 if not in map
@@ -1302,61 +1654,33 @@ func (r *RedisClientImpl) SelectDB(index int) error {
 	}
 
 	if r.isCluster {
-		if index < 0 || index > 15 {
-			return fmt.Errorf("数据库索引必须在 0-15 之间")
+		if index < 0 || index >= redisClusterLogicalDBCount {
+			return localizedRedisBackendError("redis.backend.error.select_db_index_out_of_range", map[string]any{
+				"min": 0,
+				"max": redisClusterLogicalDBCount - 1,
+			})
 		}
 		r.currentDB = index
 		r.config.RedisDB = index
 		return nil
 	}
 
-	if index < 0 || index > 15 {
-		return fmt.Errorf("数据库索引必须在 0-15 之间")
+	if index < 0 {
+		return fmt.Errorf("数据库索引必须大于等于 0")
 	}
 
-	// Create new client with different DB
-	addr := ""
-	if len(r.seedAddrs) > 0 {
-		addr = r.seedAddrs[0]
-	}
-	if r.forwarder != nil {
-		addr = r.forwarder.LocalAddr
-	}
-	if addr == "" {
-		addr = fmt.Sprintf("%s:%d", r.config.Host, r.config.Port)
-	}
-
-	timeout := normalizeRedisTimeout(r.config.Timeout)
-
-	opts := &redis.Options{
-		Addr:         addr,
-		Username:     strings.TrimSpace(r.config.User),
-		Password:     r.config.Password,
-		DB:           index,
-		DialTimeout:  timeout,
-		ReadTimeout:  timeout,
-		WriteTimeout: timeout,
-	}
-
-	newClient := redis.NewClient(opts)
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	if err := newClient.Ping(ctx).Err(); err != nil {
-		newClient.Close()
+	nextConfig := r.config
+	nextConfig.RedisDB = index
+	nextClient := &RedisClientImpl{}
+	if err := redisDBSwitchConnect(nextClient, nextConfig); err != nil {
 		return fmt.Errorf("切换数据库失败: %w", err)
 	}
 
-	// Close old client and replace
-	if r.client != nil {
-		_ = r.client.Close()
+	oldClient := r.client
+	*r = *nextClient
+	if oldClient != nil {
+		_ = oldClient.Close()
 	}
-	r.client = newClient
-	r.singleClient = newClient
-	r.clusterClient = nil
-	r.currentDB = index
-	r.config.RedisDB = index
 
 	logger.Infof("Redis 切换到数据库: db%d", index)
 	return nil

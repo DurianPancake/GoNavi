@@ -10,19 +10,26 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"GoNavi-Wails/internal/appdata"
 	"GoNavi-Wails/internal/connection"
 	"GoNavi-Wails/internal/db"
+	"GoNavi-Wails/internal/jvm"
 	"GoNavi-Wails/internal/logger"
 	proxytunnel "GoNavi-Wails/internal/proxy"
+	redisbackend "GoNavi-Wails/internal/redis"
 	"GoNavi-Wails/internal/secretstore"
+	syncbackend "GoNavi-Wails/internal/sync"
+	"GoNavi-Wails/shared/i18n"
 	"github.com/google/uuid"
 )
 
 const dbCachePingInterval = 30 * time.Second
+const dbConnectFailureCooldown = 30 * time.Second
 
 const (
 	startupConnectRetryWindow   = 20 * time.Second
@@ -33,11 +40,25 @@ const (
 var (
 	newDatabaseFunc                = db.NewDatabase
 	resolveDialConfigWithProxyFunc = resolveDialConfigWithProxy
+	driverRuntimeSupportStatusFunc = db.DriverRuntimeSupportStatus
+	verifyDriverAgentRevisionFunc  = verifyRuntimeOptionalDriverAgentRevision
+	defaultAppTextMu               sync.RWMutex
+	defaultAppTextLanguage         = i18n.LanguageEnUS
+	defaultAppTextLocalizer        *i18n.Localizer
 )
 
 type cachedDatabase struct {
-	inst     db.Database
-	lastPing time.Time
+	inst              db.Database
+	lastPing          time.Time
+	config            connection.ConnectionConfig
+	keepAliveEnabled  bool
+	keepAliveInterval time.Duration
+	keepAliveInFlight bool
+}
+
+type cachedConnectFailure struct {
+	occurredAt time.Time
+	err        error
 }
 
 type queryContext struct {
@@ -45,18 +66,39 @@ type queryContext struct {
 	started time.Time
 }
 
+type managedSQLTransaction struct {
+	id          string
+	execer      db.StatementExecer
+	transactor  db.TransactionExecer
+	cancel      context.CancelFunc
+	dbType      string
+	commitSQL   string
+	rollbackSQL string
+	createdAt   time.Time
+}
+
 // App struct
 type App struct {
-	ctx            context.Context
-	startedAt      time.Time
-	dbCache        map[string]cachedDatabase // Cache for DB connections
-	mu             sync.RWMutex              // Mutex for cache access
-	updateMu       sync.Mutex
-	updateState    updateState
-	queryMu        sync.RWMutex
-	configDir      string
-	secretStore    secretstore.SecretStore
-	runningQueries map[string]queryContext // queryID -> cancelFunc and start time
+	ctx                context.Context
+	startedAt          time.Time
+	dbCache            map[string]cachedDatabase // Cache for DB connections
+	connectFailures    map[string]cachedConnectFailure
+	mu                 sync.RWMutex // Mutex for cache access
+	updateMu           sync.Mutex
+	updateState        updateState
+	i18nMu             sync.RWMutex
+	localizer          *i18n.Localizer
+	queryMu            sync.RWMutex
+	configDir          string
+	secretStore        secretstore.SecretStore
+	runningQueries     map[string]queryContext // queryID -> cancelFunc and start time
+	sqlTransactionMu   sync.Mutex
+	sqlTransactions    map[string]*managedSQLTransaction
+	jvmPreviewTokenMu  sync.Mutex
+	jvmPreviewTokens   map[string]jvmPreviewConfirmationToken
+	jvmPreviewTokenTTL time.Duration
+	keepAliveCancel    context.CancelFunc
+	keepAliveDone      chan struct{}
 }
 
 // NewApp creates a new App application struct
@@ -69,11 +111,108 @@ func NewAppWithSecretStore(store secretstore.SecretStore) *App {
 		store = secretstore.NewUnavailableStore("secret store unavailable")
 	}
 	return &App{
-		dbCache:        make(map[string]cachedDatabase),
-		runningQueries: make(map[string]queryContext),
-		configDir:      resolveAppConfigDir(),
-		secretStore:    store,
+		dbCache:            make(map[string]cachedDatabase),
+		connectFailures:    make(map[string]cachedConnectFailure),
+		runningQueries:     make(map[string]queryContext),
+		sqlTransactions:    make(map[string]*managedSQLTransaction),
+		configDir:          resolveAppConfigDir(),
+		secretStore:        store,
+		localizer:          newAppLocalizer(),
+		jvmPreviewTokens:   make(map[string]jvmPreviewConfirmationToken),
+		jvmPreviewTokenTTL: defaultJVMPreviewConfirmationTokenTTL,
 	}
+}
+
+func newAppLocalizer() *i18n.Localizer {
+	localizer, err := i18n.NewLocalizer(i18n.LanguageEnUS)
+	if err != nil {
+		logger.Warnf("加载应用多语言目录失败：%v", err)
+		return nil
+	}
+	return localizer
+}
+
+func setDefaultAppLanguage(language i18n.Language) {
+	defaultAppTextMu.Lock()
+	defer defaultAppTextMu.Unlock()
+
+	defaultAppTextLanguage = language
+	if defaultAppTextLocalizer == nil {
+		localizer, err := i18n.NewLocalizer(language)
+		if err != nil {
+			logger.Warnf("加载默认多语言目录失败：%v", err)
+			return
+		}
+		defaultAppTextLocalizer = localizer
+		return
+	}
+	defaultAppTextLocalizer.SetLanguage(language)
+}
+
+func defaultAppText(key string, params map[string]any) string {
+	defaultAppTextMu.RLock()
+	if defaultAppTextLocalizer != nil {
+		text := defaultAppTextLocalizer.T(key, params)
+		defaultAppTextMu.RUnlock()
+		return text
+	}
+	defaultAppTextMu.RUnlock()
+
+	defaultAppTextMu.Lock()
+	defer defaultAppTextMu.Unlock()
+	if defaultAppTextLocalizer == nil {
+		localizer, err := i18n.NewLocalizer(defaultAppTextLanguage)
+		if err != nil {
+			logger.Warnf("加载默认多语言目录失败：%v", err)
+			return key
+		}
+		defaultAppTextLocalizer = localizer
+	}
+	return defaultAppTextLocalizer.T(key, params)
+}
+
+func (a *App) SetLanguage(language string) {
+	normalized, ok := i18n.NormalizeLanguage(language)
+	if !ok {
+		return
+	}
+	a.i18nMu.Lock()
+	defer a.i18nMu.Unlock()
+	if a.localizer == nil {
+		a.localizer = newAppLocalizer()
+	}
+	if a.localizer != nil {
+		a.localizer.SetLanguage(normalized)
+	}
+	setDefaultAppLanguage(normalized)
+	db.SetBackendLanguage(normalized)
+	jvm.SetBackendLanguage(normalized)
+	proxytunnel.SetBackendLanguage(normalized)
+	redisbackend.SetBackendLanguage(normalized)
+	syncbackend.SetBackendLanguage(normalized)
+}
+
+func (a *App) appText(key string, params map[string]any) string {
+	if a == nil {
+		return key
+	}
+	a.i18nMu.RLock()
+	if a.localizer != nil {
+		text := a.localizer.T(key, params)
+		a.i18nMu.RUnlock()
+		return text
+	}
+	a.i18nMu.RUnlock()
+
+	a.i18nMu.Lock()
+	defer a.i18nMu.Unlock()
+	if a.localizer == nil {
+		a.localizer = newAppLocalizer()
+	}
+	if a.localizer == nil {
+		return key
+	}
+	return a.localizer.T(key, params)
 }
 
 // InitializeLifecycle attaches runtime context without exposing lifecycle internals to Wails bindings.
@@ -89,10 +228,20 @@ func (a *App) startup(ctx context.Context) {
 	if strings.TrimSpace(a.configDir) == "" {
 		a.configDir = resolveAppConfigDir()
 	}
+	db.SetExternalDriverDownloadDirectory(appdata.DriverRoot(a.configDir))
 	logger.Init()
-	installMacNativeWindowDiagnostics(logger.Path())
+	if err := migrateDailySecretsIfNeeded(a); err != nil {
+		logger.Warnf("迁移日常密文失败：%v", err)
+	}
 	a.loadPersistedGlobalProxy()
+	if err := migrateLegacyWebKitStorageIfNeeded(a); err != nil {
+		logger.Warnf("迁移旧 WebKit 连接存储失败：%v", err)
+	}
+	if shouldInstallMacNativeWindowDiagnostics() {
+		installMacNativeWindowDiagnostics(logger.Path())
+	}
 	applyMacWindowTranslucencyFix()
+	a.startConnectionKeepAliveLoop()
 	logger.Infof("应用启动完成（首次连接保护窗口=%s，最多重试=%d 次）", startupConnectRetryWindow, startupConnectRetryAttempts)
 }
 
@@ -109,6 +258,25 @@ func (a *App) SetMacNativeWindowControls(enabled bool) {
 	setMacNativeWindowControls(enabled)
 }
 
+// ResetWebViewZoom 把 WebView2 zoom factor 强制重置为 1.0，让 WebView2 重算字体度量。
+// 用于 Windows 任务栏恢复后字体异常变大的"零感知"修复：不动窗口、零动画。
+// 仅 Windows 上生效，其他平台返回错误（前端按需忽略）。
+func (a *App) ResetWebViewZoom() (result connection.QueryResult) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			logger.Errorf("重置 WebView2 zoom 失败：%v", recovered)
+			result = connection.QueryResult{
+				Success: false,
+				Message: a.appText("app.backend.error.reset_webview_zoom_failed", map[string]any{"detail": fmt.Sprint(recovered)}),
+			}
+		}
+	}()
+	if err := resetWebViewZoomFactor(a.ctx, 1.0); err != nil {
+		return connection.QueryResult{Success: false, Message: err.Error()}
+	}
+	return connection.QueryResult{Success: true, Message: "WebView2 zoom factor reset to 1.0"}
+}
+
 // LogWindowDiagnostic 记录前端采集到的窗口诊断信息，便于排查 macOS 原生全屏异常。
 func (a *App) LogWindowDiagnostic(stage string, payload string) {
 	stage = strings.TrimSpace(stage)
@@ -119,9 +287,11 @@ func (a *App) LogWindowDiagnostic(stage string, payload string) {
 	logger.Warnf("窗口诊断：stage=%s payload=%s", stage, payload)
 }
 
-// Shutdown is called when the app terminates
-func (a *App) Shutdown(ctx context.Context) {
+// Shutdown is called when the app terminates.
+func (a *App) Shutdown() {
 	logger.Infof("应用开始关闭，准备释放资源")
+	a.stopConnectionKeepAliveLoop()
+	a.rollbackPendingSQLTransactionsOnShutdown()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for _, dbInst := range a.dbCache {
@@ -129,6 +299,7 @@ func (a *App) Shutdown(ctx context.Context) {
 			logger.Error(err, "关闭数据库连接失败")
 		}
 	}
+	a.dbCache = make(map[string]cachedDatabase)
 	proxytunnel.CloseAllForwarders()
 	// Close all Redis connections
 	CloseAllRedisClients()
@@ -136,12 +307,35 @@ func (a *App) Shutdown(ctx context.Context) {
 	logger.Close()
 }
 
+func dataRootInfoPayload(activeRoot string) map[string]interface{} {
+	defaultRoot := appdata.DefaultRoot()
+	currentRoot := strings.TrimSpace(activeRoot)
+	if currentRoot == "" {
+		currentRoot = appdata.MustResolveActiveRoot()
+	}
+	return map[string]interface{}{
+		"path":          currentRoot,
+		"defaultPath":   defaultRoot,
+		"driverPath":    appdata.DriverRoot(currentRoot),
+		"isDefaultPath": filepath.Clean(currentRoot) == filepath.Clean(defaultRoot),
+		"bootstrapPath": appdata.BootstrapPath(),
+	}
+}
+
 func normalizeCacheKeyConfig(config connection.ConnectionConfig) connection.ConnectionConfig {
 	normalized := config
 	normalized.ID = ""
 	normalized.Type = strings.ToLower(strings.TrimSpace(normalized.Type))
+	if normalized.Type == "oceanbase" {
+		protocol := resolveOceanBaseProtocolForApp(normalized)
+		normalized.ConnectionParams = normalizeOceanBaseConnectionParamsForCacheWithProtocol(normalized.ConnectionParams, protocol)
+		normalized.OceanBaseProtocol = ""
+	}
 	// timeout 仅用于 Query/Ping 控制，不应作为物理连接复用键的一部分。
 	normalized.Timeout = 0
+	// keepalive 仅影响后台保活策略，不应参与物理连接复用键。
+	normalized.KeepAliveEnabled = false
+	normalized.KeepAliveIntervalMinutes = 0
 	normalized.SavePassword = false
 
 	if !normalized.UseSSH {
@@ -170,8 +364,12 @@ func normalizeCacheKeyConfig(config connection.ConnectionConfig) connection.Conn
 		normalized.User = ""
 		normalized.Password = ""
 		normalized.URI = ""
+		normalized.ConnectionParams = ""
 		normalized.Hosts = nil
 		normalized.Topology = ""
+		normalized.RedisSentinelMaster = ""
+		normalized.RedisSentinelUser = ""
+		normalized.RedisSentinelPassword = ""
 		normalized.MySQLReplicaUser = ""
 		normalized.MySQLReplicaPassword = ""
 		normalized.ReplicaSet = ""
@@ -205,6 +403,87 @@ func getCacheKey(config connection.ConnectionConfig) string {
 	b, _ := json.Marshal(normalized)
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
+}
+
+func normalizeConnectionReleaseMatchConfig(config connection.ConnectionConfig) connection.ConnectionConfig {
+	normalized := normalizeCacheKeyConfig(config)
+	normalized.Database = ""
+	normalized.RedisDB = 0
+	normalized.ConnectionParams = ""
+	return normalized
+}
+
+func getConnectionReleaseMatchKey(config connection.ConnectionConfig) string {
+	normalized := normalizeConnectionReleaseMatchConfig(config)
+	b, _ := json.Marshal(normalized)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+type cachedDatabaseCloseTarget struct {
+	key  string
+	inst db.Database
+}
+
+func (a *App) releaseCachedDatabaseConnectionsForConfig(config connection.ConnectionConfig) int {
+	if a == nil {
+		return 0
+	}
+	return a.releaseCachedDatabaseConnectionsByMatchKey(getConnectionReleaseMatchKey(config))
+}
+
+func (a *App) releaseCachedDatabaseConnectionsByMatchKey(targetKey string) int {
+	if a == nil || strings.TrimSpace(targetKey) == "" {
+		return 0
+	}
+
+	targets := make([]cachedDatabaseCloseTarget, 0)
+	a.mu.Lock()
+	for key, entry := range a.dbCache {
+		entryConfig := entry.config
+		if strings.TrimSpace(entryConfig.Type) == "" {
+			continue
+		}
+		if getConnectionReleaseMatchKey(entryConfig) != targetKey {
+			continue
+		}
+		targets = append(targets, cachedDatabaseCloseTarget{key: key, inst: entry.inst})
+		delete(a.dbCache, key)
+	}
+	a.mu.Unlock()
+
+	for _, target := range targets {
+		if target.inst == nil {
+			continue
+		}
+		if closeErr := target.inst.Close(); closeErr != nil {
+			logger.Error(closeErr, "关闭缓存连接失败：缓存Key=%s", shortCacheKey(target.key))
+		}
+	}
+
+	return len(targets)
+}
+
+func isMySQLMaxUserConnectionsError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(normalizeErrorMessage(err))
+	return strings.Contains(message, "max_user_connections") ||
+		(strings.Contains(message, "error 1226") && strings.Contains(message, "has exceeded"))
+}
+
+func withMySQLMaxUserConnectionsHint(err error, released int) error {
+	if err == nil {
+		return nil
+	}
+	if !isMySQLMaxUserConnectionsError(err) {
+		return err
+	}
+	if released > 0 {
+		return fmt.Errorf("%w；数据库账号连接数已达上限(max_user_connections)，GoNavi 已释放同一连接实例的 %d 个缓存连接并重试；若仍失败，请关闭 Navicat/其他客户端连接或提高数据库用户 max_user_connections", err, released)
+	}
+	return fmt.Errorf("%w；数据库账号连接数已达上限(max_user_connections)，GoNavi 未找到可释放的同实例缓存连接；请关闭 Navicat/其他客户端连接或提高数据库用户 max_user_connections", err)
 }
 
 func shortCacheKey(cacheKey string) string {
@@ -283,7 +562,16 @@ func wrapConnectError(config connection.ConnectionConfig, err error) error {
 		if dbName == "" {
 			dbName = "(default)"
 		}
-		err = fmt.Errorf("数据库连接超时：%s %s:%d/%s：%w", config.Type, config.Host, config.Port, dbName, err)
+		err = errorMessageOverride{
+			message: defaultAppText("db.backend.message.connect_timeout_detail", map[string]any{
+				"dbType":   config.Type,
+				"host":     config.Host,
+				"port":     config.Port,
+				"database": dbName,
+				"detail":   normalizeErrorMessage(err),
+			}),
+			cause: err,
+		}
 	}
 
 	return withLogHint{err: err, logPath: logger.Path()}
@@ -292,6 +580,16 @@ func wrapConnectError(config connection.ConnectionConfig, err error) error {
 type errorMessageOverride struct {
 	message string
 	cause   error
+}
+
+type mongoConnectErrorLabelRewrite struct {
+	legacy string
+	key    string
+}
+
+var mongoConnectErrorLabelRewrites = []mongoConnectErrorLabelRewrite{
+	{legacy: "SSL \u4e3b\u5e93\u51ed\u636e", key: "db.backend.message.mongo_primary_credentials_label"},
+	{legacy: "SSL \u4ece\u5e93\u51ed\u636e", key: "db.backend.message.mongo_replica_credentials_label"},
 }
 
 func (e errorMessageOverride) Error() string {
@@ -313,8 +611,14 @@ func sanitizeMongoConnectErrorLabel(config connection.ConnectionConfig, err erro
 		return err
 	}
 	original := err.Error()
-	rewritten := strings.ReplaceAll(original, "SSL 主库凭据", "主库凭据")
-	rewritten = strings.ReplaceAll(rewritten, "SSL 从库凭据", "从库凭据")
+	rewritten := original
+	for _, candidate := range mongoConnectErrorLabelRewrites {
+		replacement := defaultAppText(candidate.key, nil)
+		if replacement == "" || replacement == candidate.key {
+			continue
+		}
+		rewritten = strings.ReplaceAll(rewritten, candidate.legacy, replacement)
+	}
 	if rewritten == original {
 		return err
 	}
@@ -361,6 +665,17 @@ type withLogHint struct {
 	logPath string
 }
 
+func unwrapLogHintError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var hinted withLogHint
+	if errors.As(err, &hinted) && hinted.err != nil {
+		return hinted.err
+	}
+	return err
+}
+
 func (e withLogHint) Error() string {
 	message := normalizeErrorMessage(e.err)
 	path := strings.TrimSpace(e.logPath)
@@ -371,7 +686,7 @@ func (e withLogHint) Error() string {
 	if statErr != nil || info.IsDir() || info.Size() <= 0 {
 		return message
 	}
-	return fmt.Sprintf("%s（详细日志：%s）", message, path)
+	return message + defaultAppText("driver_manager.backend.message.log_hint", map[string]any{"path": path})
 }
 
 func (e withLogHint) Unwrap() error {
@@ -411,6 +726,9 @@ func formatConnSummary(config connection.ConnectionConfig) string {
 	if strings.TrimSpace(config.URI) != "" {
 		b.WriteString(fmt.Sprintf(" URI=已配置(长度=%d)", len(config.URI)))
 	}
+	if strings.TrimSpace(config.ConnectionParams) != "" {
+		b.WriteString(fmt.Sprintf(" 连接参数=已配置(长度=%d)", len(config.ConnectionParams)))
+	}
 	if strings.TrimSpace(config.MySQLReplicaUser) != "" {
 		b.WriteString(" MySQL从库凭据=已配置")
 	}
@@ -427,6 +745,20 @@ func formatConnSummary(config connection.ConnectionConfig) string {
 		if strings.TrimSpace(config.AuthSource) != "" {
 			b.WriteString(fmt.Sprintf(" 认证库=%s", strings.TrimSpace(config.AuthSource)))
 		}
+	}
+	if strings.EqualFold(strings.TrimSpace(config.Type), "clickhouse") {
+		protocol := strings.ToLower(strings.TrimSpace(config.ClickHouseProtocol))
+		if protocol == "" {
+			protocol = "auto"
+		}
+		b.WriteString(fmt.Sprintf(" ClickHouse协议=%s", protocol))
+	}
+	if strings.EqualFold(strings.TrimSpace(config.Type), "oceanbase") {
+		protocol := "mysql"
+		if isOceanBaseOracleProtocol(config) {
+			protocol = "oracle"
+		}
+		b.WriteString(fmt.Sprintf(" OceanBase协议=%s", protocol))
 	}
 
 	if config.UseSSH {
@@ -470,16 +802,18 @@ func (a *App) getDatabase(config connection.ConnectionConfig) (db.Database, erro
 }
 
 func (a *App) openDatabaseIsolated(config connection.ConnectionConfig) (db.Database, error) {
-	resolvedConfig, err := a.resolveConnectionSecrets(config)
+	effectiveConfig, err := a.resolveEffectiveConnectionConfig(config)
 	if err != nil {
-		return nil, wrapConnectError(config, err)
+		return nil, err
 	}
-	effectiveConfig := applyGlobalProxyToConnection(resolvedConfig)
-	if supported, reason := db.DriverRuntimeSupportStatus(effectiveConfig.Type); !supported {
+	if supported, reason := driverRuntimeSupportStatusFunc(effectiveConfig.Type); !supported {
 		if strings.TrimSpace(reason) == "" {
-			reason = fmt.Sprintf("%s 驱动未启用，请先在驱动管理中安装启用", strings.TrimSpace(effectiveConfig.Type))
+			reason = a.appText("driver_manager.backend.status.optional_disabled", map[string]any{"name": strings.TrimSpace(effectiveConfig.Type)})
 		}
 		return nil, withLogHint{err: fmt.Errorf("%s", reason), logPath: logger.Path()}
+	}
+	if revisionErr := verifyDriverAgentRevisionFunc(effectiveConfig); revisionErr != nil {
+		return nil, withLogHint{err: revisionErr, logPath: logger.Path()}
 	}
 
 	dbInst, err := newDatabaseFunc(effectiveConfig.Type)
@@ -499,6 +833,14 @@ func (a *App) openDatabaseIsolated(config connection.ConnectionConfig) (db.Datab
 	return dbInst, nil
 }
 
+func (a *App) resolveEffectiveConnectionConfig(config connection.ConnectionConfig) (connection.ConnectionConfig, error) {
+	resolvedConfig, err := a.resolveConnectionSecrets(config)
+	if err != nil {
+		return config, wrapConnectError(config, err)
+	}
+	return applyGlobalProxyToConnection(resolvedConfig), nil
+}
+
 func (a *App) getDatabaseWithPing(config connection.ConnectionConfig, forcePing bool) (db.Database, error) {
 	resolvedConfig, err := a.resolveConnectionSecrets(config)
 	if err != nil {
@@ -516,9 +858,9 @@ func (a *App) getDatabaseWithPing(config connection.ConnectionConfig, forcePing 
 			strings.TrimSpace(effectiveConfig.Type), rawDSN, normalizedDSN, effectiveConfig.Timeout, forcePing, shortKey)
 	}
 
-	if supported, reason := db.DriverRuntimeSupportStatus(effectiveConfig.Type); !supported {
+	if supported, reason := driverRuntimeSupportStatusFunc(effectiveConfig.Type); !supported {
 		if strings.TrimSpace(reason) == "" {
-			reason = fmt.Sprintf("%s 驱动未启用，请先在驱动管理中安装启用", strings.TrimSpace(effectiveConfig.Type))
+			reason = a.appText("driver_manager.backend.status.optional_disabled", map[string]any{"name": strings.TrimSpace(effectiveConfig.Type)})
 		}
 		// Best-effort cleanup: if cached instance exists for this exact config, close it.
 		a.mu.Lock()
@@ -534,6 +876,20 @@ func (a *App) getDatabaseWithPing(config connection.ConnectionConfig, forcePing 
 	entry, ok := a.dbCache[key]
 	a.mu.RUnlock()
 	if ok {
+		keepAliveEnabled, keepAliveInterval := resolveConnectionKeepAliveSettings(effectiveConfig)
+		if entry.keepAliveEnabled != keepAliveEnabled || entry.keepAliveInterval != keepAliveInterval {
+			a.mu.Lock()
+			if cur, exists := a.dbCache[key]; exists && cur.inst == entry.inst {
+				cur.keepAliveEnabled = keepAliveEnabled
+				cur.keepAliveInterval = keepAliveInterval
+				if !keepAliveEnabled {
+					cur.keepAliveInFlight = false
+				}
+				a.dbCache[key] = cur
+				entry = cur
+			}
+			a.mu.Unlock()
+		}
 		if isFileDB {
 			logger.Infof("命中文件库连接缓存：类型=%s 缓存Key=%s", strings.TrimSpace(effectiveConfig.Type), shortKey)
 		}
@@ -584,16 +940,39 @@ func (a *App) getDatabaseWithPing(config connection.ConnectionConfig, forcePing 
 	if isFileDB {
 		logger.Infof("未命中文件库连接缓存，开始创建连接：类型=%s 缓存Key=%s", strings.TrimSpace(effectiveConfig.Type), shortKey)
 	}
+	if failure, remaining, ok := a.getCachedConnectFailureByKey(key); ok {
+		message := a.appText("db.backend.message.connect_failure_cooldown", map[string]any{
+			"remaining": formatConnectFailureCooldown(remaining),
+			"detail":    normalizeErrorMessage(unwrapLogHintError(failure.err)),
+		})
+		logger.Warnf("命中数据库连接失败冷却：%s 缓存Key=%s 剩余=%s 原因=%s",
+			formatConnSummary(effectiveConfig), shortKey, formatConnectFailureCooldown(remaining), normalizeErrorMessage(failure.err))
+		return nil, withLogHint{err: fmt.Errorf("%s", message), logPath: logger.Path()}
+	}
+	if revisionErr := verifyDriverAgentRevisionFunc(effectiveConfig); revisionErr != nil {
+		return nil, withLogHint{err: revisionErr, logPath: logger.Path()}
+	}
 
+	initialKey := key
 	dbInst, connectedConfig, err := a.connectDatabaseWithStartupRetry(resolvedConfig)
 	if err != nil {
-		return nil, err
+		retryInst, retryConfig, retryErr := a.retryConnectAfterMySQLMaxUserConnections(resolvedConfig, connectedConfig, err)
+		if retryErr != nil {
+			failedKey := getCacheKey(retryConfig)
+			a.recordConnectFailureByKey(failedKey, retryErr)
+			return nil, retryErr
+		}
+		dbInst = retryInst
+		connectedConfig = retryConfig
 	}
+	a.clearConnectFailureByKey(initialKey)
 	effectiveConfig = connectedConfig
 	key = getCacheKey(effectiveConfig)
 	shortKey = shortenCacheKey(key)
+	a.clearConnectFailureByKey(key)
 
 	now := time.Now()
+	keepAliveEnabled, keepAliveInterval := resolveConnectionKeepAliveSettings(effectiveConfig)
 
 	a.mu.Lock()
 	if existing, exists := a.dbCache[key]; exists && existing.inst != nil {
@@ -605,11 +984,137 @@ func (a *App) getDatabaseWithPing(config connection.ConnectionConfig, forcePing 
 		}
 		return existing.inst, nil
 	}
-	a.dbCache[key] = cachedDatabase{inst: dbInst, lastPing: now}
+	a.dbCache[key] = cachedDatabase{
+		inst:              dbInst,
+		lastPing:          now,
+		config:            normalizeCacheKeyConfig(effectiveConfig),
+		keepAliveEnabled:  keepAliveEnabled,
+		keepAliveInterval: keepAliveInterval,
+	}
 	a.mu.Unlock()
 
 	logger.Infof("数据库连接成功并写入缓存：%s 缓存Key=%s", formatConnSummary(effectiveConfig), shortKey)
 	return dbInst, nil
+}
+
+func (a *App) retryConnectAfterMySQLMaxUserConnections(rawConfig connection.ConnectionConfig, failedConfig connection.ConnectionConfig, err error) (db.Database, connection.ConnectionConfig, error) {
+	if !isMySQLMaxUserConnectionsError(err) {
+		return nil, failedConfig, err
+	}
+
+	released := a.releaseCachedDatabaseConnectionsForConfig(failedConfig)
+	logger.Warnf("检测到 MySQL 用户连接数超限，已释放同实例缓存连接：%s 数量=%d", formatConnSummary(failedConfig), released)
+	if released <= 0 {
+		return nil, failedConfig, withMySQLMaxUserConnectionsHint(err, released)
+	}
+
+	dbInst, connectedConfig, retryErr := a.connectDatabaseWithStartupRetry(rawConfig)
+	if retryErr != nil {
+		if isMySQLMaxUserConnectionsError(retryErr) {
+			return nil, connectedConfig, withMySQLMaxUserConnectionsHint(retryErr, released)
+		}
+		return nil, connectedConfig, retryErr
+	}
+	logger.Infof("MySQL 用户连接数超限释放缓存后重连成功：%s 释放数量=%d", formatConnSummary(connectedConfig), released)
+	return dbInst, connectedConfig, nil
+}
+
+func (a *App) getCachedConnectFailureByKey(key string) (cachedConnectFailure, time.Duration, bool) {
+	if a == nil || strings.TrimSpace(key) == "" {
+		return cachedConnectFailure{}, 0, false
+	}
+
+	a.mu.RLock()
+	entry, exists := a.connectFailures[key]
+	a.mu.RUnlock()
+	if !exists || entry.err == nil || entry.occurredAt.IsZero() {
+		return cachedConnectFailure{}, 0, false
+	}
+
+	remaining := dbConnectFailureCooldown - time.Since(entry.occurredAt)
+	if remaining <= 0 {
+		a.clearConnectFailureByKey(key)
+		return cachedConnectFailure{}, 0, false
+	}
+
+	return entry, remaining, true
+}
+
+func (a *App) recordConnectFailureByKey(key string, err error) {
+	if a == nil || strings.TrimSpace(key) == "" || err == nil {
+		return
+	}
+
+	a.mu.Lock()
+	if a.connectFailures == nil {
+		a.connectFailures = make(map[string]cachedConnectFailure)
+	}
+	a.connectFailures[key] = cachedConnectFailure{
+		occurredAt: time.Now(),
+		err:        err,
+	}
+	a.mu.Unlock()
+}
+
+func (a *App) clearConnectFailureByKey(key string) {
+	if a == nil || strings.TrimSpace(key) == "" {
+		return
+	}
+
+	a.mu.Lock()
+	if a.connectFailures != nil {
+		delete(a.connectFailures, key)
+	}
+	a.mu.Unlock()
+}
+
+func formatConnectFailureCooldown(remaining time.Duration) time.Duration {
+	if remaining <= time.Second {
+		return time.Second
+	}
+	return remaining.Truncate(time.Second)
+}
+
+func verifyRuntimeOptionalDriverAgentRevision(config connection.ConnectionConfig) error {
+	driverType := normalizeDriverType(config.Type)
+	if !db.IsOptionalGoDriver(driverType) {
+		return nil
+	}
+	executablePath, err := db.ResolveOptionalDriverAgentExecutablePath("", driverType)
+	if err != nil {
+		return err
+	}
+	pkg, packageMetaExists := readInstalledDriverPackage("", driverType)
+	selectedVersion := ""
+	if packageMetaExists {
+		selectedVersion = strings.TrimSpace(pkg.Version)
+	}
+	if !shouldVerifyOptionalDriverAgentRevision(driverType, selectedVersion) {
+		return nil
+	}
+	expectedRevision := strings.TrimSpace(db.OptionalDriverAgentRevision(driverType))
+	if expectedRevision == "" {
+		return nil
+	}
+	displayName := resolveDriverDisplayName(driverDefinition{Type: driverType})
+	agentRevision, current, err := optionalDriverAgentRevisionCurrent(driverType, executablePath)
+	if err != nil {
+		logger.Warnf("%s driver-agent revision 元数据不可用，继续使用已安装代理：version=%s path=%s err=%v；建议在驱动管理中重装",
+			displayName, selectedVersion, executablePath, err)
+		return nil
+	}
+	if !current {
+		actualLabel := strings.TrimSpace(agentRevision)
+		if actualLabel == "" {
+			actualLabel = "空"
+		}
+		logger.Warnf("%s driver-agent revision 不匹配，继续使用已安装代理：已安装=%s 当前需要=%s version=%s path=%s；建议在驱动管理中重装",
+			displayName, actualLabel, expectedRevision, selectedVersion, executablePath)
+		return nil
+	}
+	logger.Infof("%s driver-agent revision 校验通过：已安装=%s 当前需要=%s version=%s path=%s",
+		displayName, strings.TrimSpace(agentRevision), expectedRevision, selectedVersion, executablePath)
+	return nil
 }
 
 func shortenCacheKey(key string) string {
@@ -708,8 +1213,7 @@ func (a *App) shouldRetryConnect(err error, attempt int) bool {
 			return true
 		}
 	}
-	// Outside startup window, still grant one retry for transient network glitches.
-	return attempt == 1
+	return false
 }
 
 func isTransientStartupConnectError(err error) bool {
@@ -747,10 +1251,10 @@ func (a *App) CancelQuery(queryID string) connection.QueryResult {
 		ctx.cancel()
 		delete(a.runningQueries, queryID)
 		logger.Infof("查询已取消：queryID=%s", queryID)
-		return connection.QueryResult{Success: true, Message: "查询已取消"}
+		return connection.QueryResult{Success: true, Message: a.appText("query_editor.message.cancel_success", nil)}
 	}
 	logger.Warnf("取消查询失败：queryID=%s 不存在或已完成", queryID)
-	return connection.QueryResult{Success: false, Message: "查询不存在或已完成"}
+	return connection.QueryResult{Success: false, Message: a.appText("query_editor.message.cancel_no_running", nil)}
 }
 
 // cleanupStaleQueries removes queries older than maxAge.

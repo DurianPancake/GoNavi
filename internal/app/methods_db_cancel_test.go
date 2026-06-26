@@ -32,8 +32,8 @@ func TestCancelQuery_NonExistent(t *testing.T) {
 	if res.Success {
 		t.Fatal("CancelQuery should fail for non-existent query ID")
 	}
-	if !strings.Contains(res.Message, "不存在") && !strings.Contains(res.Message, "not exist") {
-		t.Fatalf("Expected error message about query not existing, got: %s", res.Message)
+	if expected := app.appText("query_editor.message.cancel_no_running", nil); res.Message != expected {
+		t.Fatalf("expected localized missing-query message %q, got %q", expected, res.Message)
 	}
 }
 
@@ -63,6 +63,9 @@ func TestCancelQuery_ValidQuery(t *testing.T) {
 	res := app.CancelQuery(queryID)
 	if !res.Success {
 		t.Fatalf("CancelQuery should succeed for valid query ID, got: %s", res.Message)
+	}
+	if expected := app.appText("query_editor.message.cancel_success", nil); res.Message != expected {
+		t.Fatalf("expected localized cancel success message %q, got %q", expected, res.Message)
 	}
 
 	// Verify query removed from map
@@ -145,5 +148,28 @@ func TestDBQueryWithCancel_QueryIDPropagation(t *testing.T) {
 	// The query should fail (no actual database), but QueryID should be present
 	if result.QueryID != "test-query-id" {
 		t.Fatalf("Expected QueryID 'test-query-id' in result, got: %s", result.QueryID)
+	}
+}
+
+func TestNewQueryExecutionContext_UsesTimeoutForNetworkDatabases(t *testing.T) {
+	ctx, cancel := newQueryExecutionContext(connection.ConnectionConfig{Type: "mysql", Timeout: 7})
+	defer cancel()
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("expected network database query context to carry a deadline")
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 || remaining > 8*time.Second {
+		t.Fatalf("expected deadline around 7s, got remaining=%s", remaining)
+	}
+}
+
+func TestNewQueryExecutionContext_DoesNotApplyConnectTimeoutToDuckDBQueries(t *testing.T) {
+	ctx, cancel := newQueryExecutionContext(connection.ConnectionConfig{Type: "duckdb", Timeout: 1})
+	defer cancel()
+
+	if _, ok := ctx.Deadline(); ok {
+		t.Fatal("expected DuckDB query context to avoid connection-timeout deadline")
 	}
 }

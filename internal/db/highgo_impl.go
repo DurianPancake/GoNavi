@@ -5,6 +5,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"net"
 	"net/url"
@@ -17,7 +18,7 @@ import (
 	"GoNavi-Wails/internal/ssh"
 	"GoNavi-Wails/internal/utils"
 
-	_ "github.com/highgo/pq-sm3" // HighGo uses dedicated SM3-capable driver
+	highgopq "github.com/highgo/pq-sm3" // HighGo uses dedicated SM3-capable driver
 )
 
 // HighGoDB implements Database interface for HighGo (瀚高) database
@@ -27,6 +28,13 @@ type HighGoDB struct {
 	pingTimeout time.Duration
 	forwarder   *ssh.LocalForwarder
 }
+
+type highgoSessionExecer struct {
+	*sqlConnStatementExecer
+}
+
+var _ QueryMessageExecer = (*HighGoDB)(nil)
+var _ StatementQueryMessageExecer = (*highgoSessionExecer)(nil)
 
 func (h *HighGoDB) getDSN(config connection.ConnectionConfig) string {
 	// postgres://user:password@host:port/dbname?sslmode=disable
@@ -43,7 +51,9 @@ func (h *HighGoDB) getDSN(config connection.ConnectionConfig) string {
 	u.User = url.UserPassword(config.User, config.Password)
 	q := url.Values{}
 	q.Set("sslmode", resolvePostgresSSLMode(config))
+	applyPostgresSSLPathParams(q, config)
 	q.Set("connect_timeout", strconv.Itoa(getConnectTimeoutSeconds(config)))
+	mergeConnectionParamsFromConfigWithAllowlist(q, config, highGoConnectionParamNames, "postgres", "postgresql", "highgo")
 	u.RawQuery = q.Encode()
 
 	return u.String()
@@ -93,6 +103,7 @@ func (h *HighGoDB) Connect(config connection.ConnectionConfig) error {
 			failures = append(failures, fmt.Sprintf("第%d次连接打开失败: %v", idx+1, err))
 			continue
 		}
+		configureSQLConnectionPool(db, "highgo")
 		h.conn = db
 		h.pingTimeout = getConnectTimeout(attempt)
 		if err := h.Ping(); err != nil {
@@ -150,6 +161,20 @@ func (h *HighGoDB) QueryContext(ctx context.Context, query string) ([]map[string
 	return scanRows(rows)
 }
 
+func (h *HighGoDB) QueryContextWithMessages(ctx context.Context, query string) ([]map[string]interface{}, []string, []string, error) {
+	if h.conn == nil {
+		return nil, nil, nil, fmt.Errorf("连接未打开")
+	}
+
+	conn, err := h.conn.Conn(ctx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer conn.Close()
+
+	return queryHighGoConnWithMessages(ctx, conn, query)
+}
+
 func (h *HighGoDB) Query(query string) ([]map[string]interface{}, []string, error) {
 	if h.conn == nil {
 		return nil, nil, fmt.Errorf("连接未打开")
@@ -163,6 +188,10 @@ func (h *HighGoDB) Query(query string) ([]map[string]interface{}, []string, erro
 	return scanRows(rows)
 }
 
+func (h *HighGoDB) QueryWithMessages(query string) ([]map[string]interface{}, []string, []string, error) {
+	return h.QueryContextWithMessages(context.Background(), query)
+}
+
 func (h *HighGoDB) ExecContext(ctx context.Context, query string) (int64, error) {
 	if h.conn == nil {
 		return 0, fmt.Errorf("连接未打开")
@@ -174,6 +203,28 @@ func (h *HighGoDB) ExecContext(ctx context.Context, query string) (int64, error)
 	return res.RowsAffected()
 }
 
+func (h *HighGoDB) ExecBatchContext(ctx context.Context, query string) (int64, error) {
+	if h.conn == nil {
+		return 0, fmt.Errorf("连接未打开")
+	}
+	res, err := h.conn.ExecContext(ctx, query)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (h *HighGoDB) OpenSessionExecer(ctx context.Context) (StatementExecer, error) {
+	if h.conn == nil {
+		return nil, fmt.Errorf("连接未打开")
+	}
+	conn, err := h.conn.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &highgoSessionExecer{sqlConnStatementExecer: &sqlConnStatementExecer{conn: conn}}, nil
+}
+
 func (h *HighGoDB) Exec(query string) (int64, error) {
 	if h.conn == nil {
 		return 0, fmt.Errorf("连接未打开")
@@ -183,6 +234,31 @@ func (h *HighGoDB) Exec(query string) (int64, error) {
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+func (e *highgoSessionExecer) QueryWithMessages(query string) ([]map[string]interface{}, []string, []string, error) {
+	return e.QueryContextWithMessages(context.Background(), query)
+}
+
+func (e *highgoSessionExecer) QueryContextWithMessages(ctx context.Context, query string) ([]map[string]interface{}, []string, []string, error) {
+	if e == nil || e.conn == nil {
+		return nil, nil, nil, fmt.Errorf("连接未打开")
+	}
+	return queryHighGoConnWithMessages(ctx, e.conn, query)
+}
+
+func queryHighGoConnWithMessages(ctx context.Context, conn *sql.Conn, query string) ([]map[string]interface{}, []string, []string, error) {
+	return querySQLConnWithTextNotices(ctx, conn, query, func(driverConn driver.Conn, addNotice func(string)) {
+		if addNotice == nil {
+			highgopq.SetNoticeHandler(driverConn, nil)
+			return
+		}
+		highgopq.SetNoticeHandler(driverConn, func(notice *highgopq.Error) {
+			if notice != nil {
+				addNotice(notice.Message)
+			}
+		})
+	})
 }
 
 func (h *HighGoDB) GetDatabases() ([]string, error) {
@@ -200,7 +276,7 @@ func (h *HighGoDB) GetDatabases() ([]string, error) {
 }
 
 func (h *HighGoDB) GetTables(dbName string) ([]string, error) {
-	query := "SELECT schemaname, tablename FROM pg_catalog.pg_tables WHERE schemaname != 'information_schema' AND schemaname NOT LIKE 'pg_%' ORDER BY schemaname, tablename"
+	query := "SELECT schemaname, tablename FROM pg_catalog.pg_tables WHERE schemaname != 'information_schema' AND schemaname NOT LIKE 'pg|_%' ESCAPE '|' ORDER BY schemaname, tablename"
 	data, _, err := h.Query(query)
 	if err != nil {
 		return nil, err
@@ -226,178 +302,31 @@ func (h *HighGoDB) GetCreateStatement(dbName, tableName string) (string, error) 
 }
 
 func (h *HighGoDB) GetColumns(dbName, tableName string) ([]connection.ColumnDefinition, error) {
-	schema := strings.TrimSpace(dbName)
-	if schema == "" {
-		schema = "public"
-	}
-	table := strings.TrimSpace(tableName)
+	schema, table := normalizePGLikeMetadataTable(dbName, tableName)
 	if table == "" {
-		return nil, fmt.Errorf("表名不能为空")
+		return nil, localizedDatabaseRuntimeError("db.backend.error.table_name_required", nil)
 	}
 
-	esc := func(s string) string { return strings.ReplaceAll(s, "'", "''") }
-
-	query := fmt.Sprintf(`
-SELECT
-	a.attname AS column_name,
-	pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
-	CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable,
-	pg_get_expr(ad.adbin, ad.adrelid) AS column_default,
-	col_description(a.attrelid, a.attnum) AS comment,
-	CASE WHEN pk.attname IS NOT NULL THEN 'PRI' ELSE '' END AS column_key
-FROM pg_class c
-JOIN pg_namespace n ON n.oid = c.relnamespace
-JOIN pg_attribute a ON a.attrelid = c.oid
-LEFT JOIN pg_attrdef ad ON ad.adrelid = c.oid AND ad.adnum = a.attnum
-LEFT JOIN (
-	SELECT i.indrelid, a3.attname
-	FROM pg_index i
-	JOIN pg_attribute a3 ON a3.attrelid = i.indrelid AND a3.attnum = ANY(i.indkey)
-	WHERE i.indisprimary
-) pk ON pk.indrelid = c.oid AND pk.attname = a.attname
-WHERE c.relkind IN ('r', 'p')
-  AND n.nspname = '%s'
-  AND c.relname = '%s'
-  AND a.attnum > 0
-  AND NOT a.attisdropped
-ORDER BY a.attnum`, esc(schema), esc(table))
-
-	data, _, err := h.Query(query)
+	data, _, err := h.Query(buildPGLikeColumnsMetadataQuery(schema, table))
 	if err != nil {
 		return nil, err
 	}
 
-	var columns []connection.ColumnDefinition
-	for _, row := range data {
-		col := connection.ColumnDefinition{
-			Name:     fmt.Sprintf("%v", row["column_name"]),
-			Type:     fmt.Sprintf("%v", row["data_type"]),
-			Nullable: fmt.Sprintf("%v", row["is_nullable"]),
-			Key:      fmt.Sprintf("%v", row["column_key"]),
-			Extra:    "",
-			Comment:  "",
-		}
-
-		if v, ok := row["comment"]; ok && v != nil {
-			col.Comment = fmt.Sprintf("%v", v)
-		}
-
-		if v, ok := row["column_default"]; ok && v != nil {
-			def := fmt.Sprintf("%v", v)
-			col.Default = &def
-			if strings.HasPrefix(strings.ToLower(strings.TrimSpace(def)), "nextval(") {
-				col.Extra = "auto_increment"
-			}
-		}
-
-		columns = append(columns, col)
-	}
-	return columns, nil
+	return buildPGLikeColumnDefinitions(data), nil
 }
 
 func (h *HighGoDB) GetIndexes(dbName, tableName string) ([]connection.IndexDefinition, error) {
-	schema := strings.TrimSpace(dbName)
-	if schema == "" {
-		schema = "public"
-	}
-	table := strings.TrimSpace(tableName)
+	schema, table := normalizePGLikeMetadataTable(dbName, tableName)
 	if table == "" {
-		return nil, fmt.Errorf("表名不能为空")
+		return nil, localizedDatabaseRuntimeError("db.backend.error.table_name_required", nil)
 	}
 
-	esc := func(s string) string { return strings.ReplaceAll(s, "'", "''") }
-
-	query := fmt.Sprintf(`
-SELECT
-	i.relname AS index_name,
-	a.attname AS column_name,
-	ix.indisunique AS is_unique,
-	x.ordinality AS seq_in_index,
-	am.amname AS index_type
-FROM pg_class t
-JOIN pg_namespace n ON n.oid = t.relnamespace
-JOIN pg_index ix ON t.oid = ix.indrelid
-JOIN pg_class i ON i.oid = ix.indexrelid
-JOIN pg_am am ON i.relam = am.oid
-JOIN unnest(ix.indkey) WITH ORDINALITY AS x(attnum, ordinality) ON TRUE
-JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = x.attnum
-WHERE t.relkind IN ('r', 'p')
-  AND t.relname = '%s'
-  AND n.nspname = '%s'
-ORDER BY i.relname, x.ordinality`, esc(table), esc(schema))
-
-	data, _, err := h.Query(query)
+	data, _, err := h.Query(buildPGLikeIndexesMetadataQuery(schema, table))
 	if err != nil {
 		return nil, err
 	}
 
-	parseBool := func(v interface{}) bool {
-		switch val := v.(type) {
-		case bool:
-			return val
-		case string:
-			s := strings.ToLower(strings.TrimSpace(val))
-			return s == "t" || s == "true" || s == "1" || s == "y" || s == "yes"
-		default:
-			s := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", v)))
-			return s == "t" || s == "true" || s == "1" || s == "y" || s == "yes"
-		}
-	}
-
-	parseInt := func(v interface{}) int {
-		switch val := v.(type) {
-		case int:
-			return val
-		case int64:
-			return int(val)
-		case float64:
-			return int(val)
-		case string:
-			var n int
-			_, _ = fmt.Sscanf(strings.TrimSpace(val), "%d", &n)
-			return n
-		default:
-			var n int
-			_, _ = fmt.Sscanf(strings.TrimSpace(fmt.Sprintf("%v", v)), "%d", &n)
-			return n
-		}
-	}
-
-	var indexes []connection.IndexDefinition
-	for _, row := range data {
-		isUnique := false
-		if v, ok := row["is_unique"]; ok && v != nil {
-			isUnique = parseBool(v)
-		}
-
-		nonUnique := 1
-		if isUnique {
-			nonUnique = 0
-		}
-
-		seq := 0
-		if v, ok := row["seq_in_index"]; ok && v != nil {
-			seq = parseInt(v)
-		}
-
-		indexType := ""
-		if v, ok := row["index_type"]; ok && v != nil {
-			indexType = strings.ToUpper(fmt.Sprintf("%v", v))
-		}
-		if indexType == "" {
-			indexType = "BTREE"
-		}
-
-		idx := connection.IndexDefinition{
-			Name:       fmt.Sprintf("%v", row["index_name"]),
-			ColumnName: fmt.Sprintf("%v", row["column_name"]),
-			NonUnique:  nonUnique,
-			SeqInIndex: seq,
-			IndexType:  indexType,
-		}
-		indexes = append(indexes, idx)
-	}
-	return indexes, nil
+	return buildPGLikeIndexDefinitions(data), nil
 }
 
 func (h *HighGoDB) GetForeignKeys(dbName, tableName string) ([]connection.ForeignKeyDefinition, error) {
@@ -407,7 +336,7 @@ func (h *HighGoDB) GetForeignKeys(dbName, tableName string) ([]connection.Foreig
 	}
 	table := strings.TrimSpace(tableName)
 	if table == "" {
-		return nil, fmt.Errorf("表名不能为空")
+		return nil, localizedDatabaseRuntimeError("db.backend.error.table_name_required", nil)
 	}
 
 	esc := func(s string) string { return strings.ReplaceAll(s, "'", "''") }
@@ -467,7 +396,7 @@ func (h *HighGoDB) GetTriggers(dbName, tableName string) ([]connection.TriggerDe
 	}
 	table := strings.TrimSpace(tableName)
 	if table == "" {
-		return nil, fmt.Errorf("表名不能为空")
+		return nil, localizedDatabaseRuntimeError("db.backend.error.table_name_required", nil)
 	}
 
 	esc := func(s string) string { return strings.ReplaceAll(s, "'", "''") }
@@ -499,11 +428,19 @@ ORDER BY trigger_name, event_manipulation`, esc(table), esc(schema))
 
 func (h *HighGoDB) GetAllColumns(dbName string) ([]connection.ColumnDefinitionWithTable, error) {
 	query := `
-SELECT table_schema, table_name, column_name, data_type
-FROM information_schema.columns
-WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
-  AND table_schema NOT LIKE 'pg_%'
-ORDER BY table_schema, table_name, ordinal_position`
+SELECT
+	c.table_schema,
+	c.table_name,
+	c.column_name,
+	c.data_type,
+	col_description(cls.oid, a.attnum) AS comment
+FROM information_schema.columns c
+LEFT JOIN pg_namespace n ON n.nspname = c.table_schema
+LEFT JOIN pg_class cls ON cls.relnamespace = n.oid AND cls.relname = c.table_name
+LEFT JOIN pg_attribute a ON a.attrelid = cls.oid AND a.attname = c.column_name
+WHERE c.table_schema NOT IN ('pg_catalog', 'information_schema')
+  AND c.table_schema NOT LIKE 'pg|_%' ESCAPE '|'
+ORDER BY c.table_schema, c.table_name, c.ordinal_position`
 
 	data, _, err := h.Query(query)
 	if err != nil {
@@ -523,6 +460,7 @@ ORDER BY table_schema, table_name, ordinal_position`
 			TableName: tableName,
 			Name:      fmt.Sprintf("%v", row["column_name"]),
 			Type:      fmt.Sprintf("%v", row["data_type"]),
+			Comment:   fmt.Sprintf("%v", row["comment"]),
 		}
 		cols = append(cols, col)
 	}
@@ -616,28 +554,18 @@ func (h *HighGoDB) ApplyChanges(tableName string, changes connection.ChangeSet) 
 		}
 	}
 
-	// 3. Inserts
-	for _, row := range changes.Inserts {
-		var cols []string
-		var placeholders []string
-		var args []interface{}
-		idx := 0
-
-		for k, v := range row {
-			idx++
-			cols = append(cols, quoteIdent(k))
-			placeholders = append(placeholders, fmt.Sprintf("$%d", idx))
-			args = append(args, v)
-		}
-
-		if len(cols) == 0 {
-			continue
-		}
-
-		query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", qualifiedTable, strings.Join(cols, ", "), strings.Join(placeholders, ", "))
-		if _, err := tx.Exec(query, args...); err != nil {
-			return fmt.Errorf("插入失败：%v", err)
-		}
+	if err := execParameterizedInsertBatches(parameterizedInsertConfig{
+		Table:       qualifiedTable,
+		Rows:        changes.Inserts,
+		QuoteColumn: quoteIdent,
+		Placeholder: func(idx int) string {
+			return fmt.Sprintf("$%d", idx)
+		},
+		Exec: func(query string, args ...interface{}) (sql.Result, error) {
+			return tx.Exec(query, args...)
+		},
+	}); err != nil {
+		return err
 	}
 
 	return tx.Commit()

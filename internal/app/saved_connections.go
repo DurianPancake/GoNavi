@@ -7,7 +7,9 @@ import (
 	"path/filepath"
 	"strings"
 
+	"GoNavi-Wails/internal/appdata"
 	"GoNavi-Wails/internal/connection"
+	"GoNavi-Wails/internal/dailysecret"
 	"GoNavi-Wails/internal/secretstore"
 	"github.com/google/uuid"
 )
@@ -18,14 +20,15 @@ const (
 )
 
 type connectionSecretBundle struct {
-	Password             string `json:"password,omitempty"`
-	SSHPassword          string `json:"sshPassword,omitempty"`
-	ProxyPassword        string `json:"proxyPassword,omitempty"`
-	HTTPTunnelPassword   string `json:"httpTunnelPassword,omitempty"`
-	MySQLReplicaPassword string `json:"mysqlReplicaPassword,omitempty"`
-	MongoReplicaPassword string `json:"mongoReplicaPassword,omitempty"`
-	OpaqueURI            string `json:"opaqueURI,omitempty"`
-	OpaqueDSN            string `json:"opaqueDSN,omitempty"`
+	Password              string `json:"password,omitempty"`
+	SSHPassword           string `json:"sshPassword,omitempty"`
+	ProxyPassword         string `json:"proxyPassword,omitempty"`
+	HTTPTunnelPassword    string `json:"httpTunnelPassword,omitempty"`
+	MySQLReplicaPassword  string `json:"mysqlReplicaPassword,omitempty"`
+	MongoReplicaPassword  string `json:"mongoReplicaPassword,omitempty"`
+	RedisSentinelPassword string `json:"redisSentinelPassword,omitempty"`
+	OpaqueURI             string `json:"opaqueURI,omitempty"`
+	OpaqueDSN             string `json:"opaqueDSN,omitempty"`
 }
 
 type savedConnectionsFile struct {
@@ -38,11 +41,7 @@ type savedConnectionRepository struct {
 }
 
 func resolveAppConfigDir() string {
-	homeDir, err := os.UserHomeDir()
-	if err != nil || strings.TrimSpace(homeDir) == "" {
-		return "."
-	}
-	return filepath.Join(homeDir, ".gonavi")
+	return appdata.MustResolveActiveRoot()
 }
 
 func newSavedConnectionRepository(configDir string, store secretstore.SecretStore) *savedConnectionRepository {
@@ -62,6 +61,7 @@ func (b connectionSecretBundle) hasAny() bool {
 		strings.TrimSpace(b.HTTPTunnelPassword) != "" ||
 		strings.TrimSpace(b.MySQLReplicaPassword) != "" ||
 		strings.TrimSpace(b.MongoReplicaPassword) != "" ||
+		strings.TrimSpace(b.RedisSentinelPassword) != "" ||
 		strings.TrimSpace(b.OpaqueURI) != "" ||
 		strings.TrimSpace(b.OpaqueDSN) != ""
 }
@@ -85,6 +85,9 @@ func mergeConnectionSecretBundles(base, overlay connectionSecretBundle) connecti
 	}
 	if strings.TrimSpace(overlay.MongoReplicaPassword) != "" {
 		merged.MongoReplicaPassword = overlay.MongoReplicaPassword
+	}
+	if strings.TrimSpace(overlay.RedisSentinelPassword) != "" {
+		merged.RedisSentinelPassword = overlay.RedisSentinelPassword
 	}
 	if strings.TrimSpace(overlay.OpaqueURI) != "" {
 		merged.OpaqueURI = overlay.OpaqueURI
@@ -114,6 +117,9 @@ func applyConnectionSecretClears(bundle connectionSecretBundle, input connection
 	}
 	if input.ClearMongoReplicaPassword {
 		cleared.MongoReplicaPassword = ""
+	}
+	if input.ClearRedisSentinelPassword {
+		cleared.RedisSentinelPassword = ""
 	}
 	if input.ClearOpaqueURI {
 		cleared.OpaqueURI = ""
@@ -152,62 +158,36 @@ func splitConnectionSecrets(input connection.SavedConnectionInput) (connection.S
 	meta.ID = id
 	meta.SavePassword = false
 
-	bundle := connectionSecretBundle{}
-	if strings.TrimSpace(meta.Password) != "" {
-		bundle.Password = meta.Password
-		meta.Password = ""
-	}
-	if strings.TrimSpace(meta.SSH.Password) != "" {
-		bundle.SSHPassword = meta.SSH.Password
-		meta.SSH.Password = ""
-	}
-	if strings.TrimSpace(meta.Proxy.Password) != "" {
-		bundle.ProxyPassword = meta.Proxy.Password
-		meta.Proxy.Password = ""
-	}
-	if strings.TrimSpace(meta.HTTPTunnel.Password) != "" {
-		bundle.HTTPTunnelPassword = meta.HTTPTunnel.Password
-		meta.HTTPTunnel.Password = ""
-	}
-	if strings.TrimSpace(meta.MySQLReplicaPassword) != "" {
-		bundle.MySQLReplicaPassword = meta.MySQLReplicaPassword
-		meta.MySQLReplicaPassword = ""
-	}
-	if strings.TrimSpace(meta.MongoReplicaPassword) != "" {
-		bundle.MongoReplicaPassword = meta.MongoReplicaPassword
-		meta.MongoReplicaPassword = ""
-	}
-	if strings.TrimSpace(meta.URI) != "" {
-		bundle.OpaqueURI = meta.URI
-		meta.URI = ""
-	}
-	if strings.TrimSpace(meta.DSN) != "" {
-		bundle.OpaqueDSN = meta.DSN
-		meta.DSN = ""
-	}
+	bundle := extractConnectionSecretBundle(meta)
+	meta = stripConnectionSecretFields(meta)
 
 	view := connection.SavedConnectionView{
-		ID:                      id,
-		Name:                    strings.TrimSpace(input.Name),
-		Config:                  meta,
-		IncludeDatabases:        cloneStringSlice(input.IncludeDatabases),
-		IncludeRedisDatabases:   cloneIntSlice(input.IncludeRedisDatabases),
-		IconType:                strings.TrimSpace(input.IconType),
-		IconColor:               strings.TrimSpace(input.IconColor),
-		HasPrimaryPassword:      strings.TrimSpace(bundle.Password) != "",
-		HasSSHPassword:          strings.TrimSpace(bundle.SSHPassword) != "",
-		HasProxyPassword:        strings.TrimSpace(bundle.ProxyPassword) != "",
-		HasHTTPTunnelPassword:   strings.TrimSpace(bundle.HTTPTunnelPassword) != "",
-		HasMySQLReplicaPassword: strings.TrimSpace(bundle.MySQLReplicaPassword) != "",
-		HasMongoReplicaPassword: strings.TrimSpace(bundle.MongoReplicaPassword) != "",
-		HasOpaqueURI:            strings.TrimSpace(bundle.OpaqueURI) != "",
-		HasOpaqueDSN:            strings.TrimSpace(bundle.OpaqueDSN) != "",
+		ID:                       id,
+		Name:                     strings.TrimSpace(input.Name),
+		Config:                   meta,
+		IncludeDatabases:         cloneStringSlice(input.IncludeDatabases),
+		IncludeRedisDatabases:    cloneIntSlice(input.IncludeRedisDatabases),
+		IconType:                 strings.TrimSpace(input.IconType),
+		IconColor:                strings.TrimSpace(input.IconColor),
+		HasPrimaryPassword:       strings.TrimSpace(bundle.Password) != "",
+		HasSSHPassword:           strings.TrimSpace(bundle.SSHPassword) != "",
+		HasProxyPassword:         strings.TrimSpace(bundle.ProxyPassword) != "",
+		HasHTTPTunnelPassword:    strings.TrimSpace(bundle.HTTPTunnelPassword) != "",
+		HasMySQLReplicaPassword:  strings.TrimSpace(bundle.MySQLReplicaPassword) != "",
+		HasMongoReplicaPassword:  strings.TrimSpace(bundle.MongoReplicaPassword) != "",
+		HasRedisSentinelPassword: strings.TrimSpace(bundle.RedisSentinelPassword) != "",
+		HasOpaqueURI:             strings.TrimSpace(bundle.OpaqueURI) != "",
+		HasOpaqueDSN:             strings.TrimSpace(bundle.OpaqueDSN) != "",
 	}
 	return view, bundle
 }
 
 func (r *savedConnectionRepository) connectionsPath() string {
 	return filepath.Join(r.configDir, savedConnectionsFileName)
+}
+
+func (r *savedConnectionRepository) dailySecrets() *dailysecret.Store {
+	return dailysecret.NewStore(r.configDir)
 }
 
 func (r *savedConnectionRepository) load() ([]connection.SavedConnectionView, error) {
@@ -272,26 +252,20 @@ func (r *savedConnectionRepository) Save(input connection.SavedConnectionInput) 
 			return connection.SavedConnectionView{}, bundleErr
 		}
 		mergedBundle = mergeConnectionSecretBundles(existingBundle, bundle)
-		view.SecretRef = existing.SecretRef
 	}
 	mergedBundle = applyConnectionSecretClears(mergedBundle, input)
 
 	if mergedBundle.hasAny() {
-		ref, storeErr := r.storeSecretBundle(view.ID, view.SecretRef, mergedBundle)
-		if storeErr != nil {
+		if storeErr := r.saveSecretBundle(view.ID, mergedBundle); storeErr != nil {
 			return connection.SavedConnectionView{}, storeErr
 		}
-		view.SecretRef = ref
-		applyConnectionBundleFlags(&view, mergedBundle)
 	} else {
-		if index >= 0 && strings.TrimSpace(existing.SecretRef) != "" {
-			if deleteErr := r.secretStore.Delete(existing.SecretRef); deleteErr != nil {
-				return connection.SavedConnectionView{}, deleteErr
-			}
+		if deleteErr := r.deleteSecretBundle(view.ID); deleteErr != nil {
+			return connection.SavedConnectionView{}, deleteErr
 		}
-		view.SecretRef = ""
-		applyConnectionBundleFlags(&view, connectionSecretBundle{})
 	}
+	view.SecretRef = ""
+	applyConnectionBundleFlags(&view, mergedBundle)
 
 	if index >= 0 {
 		connections[index] = view
@@ -315,6 +289,14 @@ func (r *savedConnectionRepository) Find(id string) (connection.SavedConnectionV
 		}
 	}
 	return connection.SavedConnectionView{}, fmt.Errorf("saved connection not found: %s", id)
+}
+
+func (r *savedConnectionRepository) saveSecretBundle(id string, bundle connectionSecretBundle) error {
+	return r.dailySecrets().PutConnection(id, toDailyConnectionBundle(bundle))
+}
+
+func (r *savedConnectionRepository) deleteSecretBundle(id string) error {
+	return r.dailySecrets().DeleteConnection(id)
 }
 
 func (r *savedConnectionRepository) storeSecretBundle(id string, existingRef string, bundle connectionSecretBundle) (string, error) {
@@ -343,9 +325,24 @@ func (r *savedConnectionRepository) storeSecretBundle(id string, existingRef str
 }
 
 func (r *savedConnectionRepository) loadSecretBundle(view connection.SavedConnectionView) (connectionSecretBundle, error) {
+	inline := extractConnectionSecretBundle(view.Config)
+	if inline.hasAny() {
+		return inline, nil
+	}
 	if !savedConnectionViewHasSecrets(view) {
 		return connectionSecretBundle{}, nil
 	}
+	bundle, ok, err := r.dailySecrets().GetConnection(view.ID)
+	if err != nil {
+		return connectionSecretBundle{}, err
+	}
+	if ok {
+		return fromDailyConnectionBundle(bundle), nil
+	}
+	return connectionSecretBundle{}, os.ErrNotExist
+}
+
+func (r *savedConnectionRepository) loadSecretBundleFromStore(view connection.SavedConnectionView) (connectionSecretBundle, error) {
 	if r.secretStore == nil {
 		return connectionSecretBundle{}, fmt.Errorf("secret store unavailable")
 	}
@@ -370,7 +367,7 @@ func (r *savedConnectionRepository) loadSecretBundle(view connection.SavedConnec
 
 func savedConnectionViewHasSecrets(view connection.SavedConnectionView) bool {
 	return view.HasPrimaryPassword || view.HasSSHPassword || view.HasProxyPassword || view.HasHTTPTunnelPassword ||
-		view.HasMySQLReplicaPassword || view.HasMongoReplicaPassword || view.HasOpaqueURI || view.HasOpaqueDSN
+		view.HasMySQLReplicaPassword || view.HasMongoReplicaPassword || view.HasRedisSentinelPassword || view.HasOpaqueURI || view.HasOpaqueDSN
 }
 
 func applyConnectionBundleFlags(view *connection.SavedConnectionView, bundle connectionSecretBundle) {
@@ -380,16 +377,23 @@ func applyConnectionBundleFlags(view *connection.SavedConnectionView, bundle con
 	view.HasHTTPTunnelPassword = strings.TrimSpace(bundle.HTTPTunnelPassword) != ""
 	view.HasMySQLReplicaPassword = strings.TrimSpace(bundle.MySQLReplicaPassword) != ""
 	view.HasMongoReplicaPassword = strings.TrimSpace(bundle.MongoReplicaPassword) != ""
+	view.HasRedisSentinelPassword = strings.TrimSpace(bundle.RedisSentinelPassword) != ""
 	view.HasOpaqueURI = strings.TrimSpace(bundle.OpaqueURI) != ""
 	view.HasOpaqueDSN = strings.TrimSpace(bundle.OpaqueDSN) != ""
 }
 
-func buildDuplicateConnectionName(baseName string, existing []connection.SavedConnectionView) string {
+func buildDuplicateConnectionName(baseName string, existing []connection.SavedConnectionView, unnamedName string, copySuffix string) string {
 	trimmedBaseName := strings.TrimSpace(baseName)
 	if trimmedBaseName == "" {
-		trimmedBaseName = "连接"
+		trimmedBaseName = strings.TrimSpace(unnamedName)
 	}
-	suffix := " - 副本"
+	if trimmedBaseName == "" {
+		trimmedBaseName = "Unnamed Connection"
+	}
+	suffix := copySuffix
+	if strings.TrimSpace(suffix) == "" {
+		suffix = " - Copy"
+	}
 	usedNames := make(map[string]struct{}, len(existing))
 	for _, item := range existing {
 		usedNames[strings.TrimSpace(item.Name)] = struct{}{}
@@ -417,10 +421,8 @@ func (r *savedConnectionRepository) Delete(id string) error {
 	filtered := make([]connection.SavedConnectionView, 0, len(connections))
 	for _, item := range connections {
 		if item.ID == strings.TrimSpace(id) {
-			if strings.TrimSpace(item.SecretRef) != "" && r.secretStore != nil {
-				if deleteErr := r.secretStore.Delete(item.SecretRef); deleteErr != nil {
-					return deleteErr
-				}
+			if deleteErr := r.deleteSecretBundle(item.ID); deleteErr != nil {
+				return deleteErr
 			}
 			continue
 		}
@@ -429,7 +431,7 @@ func (r *savedConnectionRepository) Delete(id string) error {
 	return r.saveAll(filtered)
 }
 
-func (r *savedConnectionRepository) Duplicate(id string) (connection.SavedConnectionView, error) {
+func (r *savedConnectionRepository) Duplicate(id string, unnamedName string, copySuffix string) (connection.SavedConnectionView, error) {
 	connections, err := r.load()
 	if err != nil {
 		return connection.SavedConnectionView{}, err
@@ -450,23 +452,19 @@ func (r *savedConnectionRepository) Duplicate(id string) (connection.SavedConnec
 	duplicate := original
 	duplicate.ID = "conn-" + uuid.New().String()[:8]
 	duplicate.Config.ID = duplicate.ID
-	duplicate.Name = buildDuplicateConnectionName(original.Name, connections)
+	duplicate.Name = buildDuplicateConnectionName(original.Name, connections, unnamedName, copySuffix)
 
 	bundle, err := r.loadSecretBundle(original)
 	if err != nil {
 		return connection.SavedConnectionView{}, err
 	}
 	if bundle.hasAny() {
-		ref, storeErr := r.storeSecretBundle(duplicate.ID, "", bundle)
-		if storeErr != nil {
+		if storeErr := r.saveSecretBundle(duplicate.ID, bundle); storeErr != nil {
 			return connection.SavedConnectionView{}, storeErr
 		}
-		duplicate.SecretRef = ref
-		applyConnectionBundleFlags(&duplicate, bundle)
-	} else {
-		duplicate.SecretRef = ""
-		applyConnectionBundleFlags(&duplicate, connectionSecretBundle{})
 	}
+	duplicate.SecretRef = ""
+	applyConnectionBundleFlags(&duplicate, bundle)
 
 	connections = append(connections, duplicate)
 	if err := r.saveAll(connections); err != nil {

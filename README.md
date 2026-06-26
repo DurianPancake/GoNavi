@@ -39,6 +39,7 @@ GoNavi is designed for developers and DBAs who need a unified desktop experience
 | Cache | Redis | Built-in | Key browsing, command execution, encoding/view switch |
 | Relational | MariaDB | Optional driver agent | Querying, object management, data editing |
 | Relational | Doris | Optional driver agent | Querying, object browsing, SQL execution |
+| Columnar Analytics | StarRocks | Optional driver agent | Querying, object browsing, SQL execution |
 | Search | Sphinx | Optional driver agent | SphinxQL querying and object browsing |
 | Relational | SQL Server | Optional driver agent | Schema browsing, SQL query, object management |
 | File-based | SQLite | Optional driver agent | Local DB browsing, editing, export |
@@ -50,6 +51,8 @@ GoNavi is designed for developers and DBAs who need a unified desktop experience
 | Document | MongoDB | Optional driver agent | Document query, collection browsing, connection management |
 | Time-series | TDengine | Optional driver agent | Time-series schema browsing and querying |
 | Columnar Analytics | ClickHouse | Optional driver agent | Analytical query, object browsing, SQL execution |
+| Federated Query | Trino | Optional driver agent | Cross-source SQL via multiple catalogs, `catalog.schema` browsing, SQL execution |
+| Search | Elasticsearch | Optional driver agent | Index browsing, mapping inspection, JSON DSL / query_string search |
 | Extensibility | Custom Driver/DSN | Custom | Extend to more data sources via Driver + DSN |
 
 <h2 align="center">📸 Screenshots</h2>
@@ -132,17 +135,26 @@ GoNavi is designed for developers and DBAs who need a unified desktop experience
 - [Go](https://go.dev/dl/) 1.21+
 - [Node.js](https://nodejs.org/) 18+
 - [Wails CLI](https://wails.io/docs/gettingstarted/installation):
-  `go install github.com/wailsapp/wails/v2/cmd/wails@latest`
+  `go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0`
 
 ### Development Mode
 
-```bash
+```shell
 # Clone
 git clone https://github.com/Syngnat/GoNavi.git
 cd GoNavi
 
 # Start development with hot reload
 wails dev
+
+# Faster local startup when exported Go method signatures are unchanged
+node tools/wails-fast-dev.mjs
+
+# Refresh Wails JS bindings after changing exported Go method signatures
+node tools/wails-fast-dev.mjs --refresh-bindings
+
+# Windows PowerShell low-memory visual mode: disables transparent WebView/Acrylic backdrop
+$env:GONAVI_LOW_MEMORY_MODE="1"; node tools/wails-fast-dev.mjs
 ```
 
 ### Build
@@ -202,6 +214,16 @@ sudo apt-get install -y libgtk-3-0 libwebkit2gtk-4.0-37 libjavascriptcoregtk-4.0
 
 If you use Linux artifacts with the `-WebKit41` suffix, prefer Debian 13 / Ubuntu 24.04+.
 
+### Linux: Chinese text appears as square boxes
+
+Minimal Ubuntu 24.04 LTS desktop/server environments may not include Chinese CJK fonts. Install Noto / WenQuanYi fonts and restart GoNavi:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y fonts-noto-cjk fonts-wqy-microhei
+fc-cache -fv
+```
+
 ---
 
 ## Contributing
@@ -212,7 +234,7 @@ For the full workflow, branch model, and maintainer sync rules, see:
 
 - [CONTRIBUTING.md](CONTRIBUTING.md)
 
-External contributors should open pull requests directly against `main`.
+External contributors should branch from `dev` and open pull requests against `dev`.
 
 ## Star History
 <a href="https://www.star-history.com/?repos=Syngnat%2FGoNavi&type=date&legend=top-left">

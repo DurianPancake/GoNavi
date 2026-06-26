@@ -14,18 +14,20 @@ func resolveDialConfigWithProxy(raw connection.ConnectionConfig) (connection.Con
 	config := raw
 	if config.UseHTTPTunnel {
 		if config.UseProxy {
-			return connection.ConnectionConfig{}, fmt.Errorf("HTTP 隧道与普通代理不能同时启用")
+			return connection.ConnectionConfig{}, fmt.Errorf("%s", defaultAppText("db.backend.error.http_tunnel_proxy_conflict", nil))
 		}
 		tunnelHost := strings.TrimSpace(config.HTTPTunnel.Host)
 		if tunnelHost == "" {
-			return connection.ConnectionConfig{}, fmt.Errorf("HTTP 隧道主机不能为空")
+			return connection.ConnectionConfig{}, fmt.Errorf("%s", defaultAppText("db.backend.error.http_tunnel_host_required", nil))
 		}
 		tunnelPort := config.HTTPTunnel.Port
 		if tunnelPort <= 0 {
 			tunnelPort = 8080
 		}
 		if tunnelPort > 65535 {
-			return connection.ConnectionConfig{}, fmt.Errorf("HTTP 隧道端口无效：%d", config.HTTPTunnel.Port)
+			return connection.ConnectionConfig{}, fmt.Errorf("%s", defaultAppText("db.backend.error.http_tunnel_port_invalid", map[string]any{
+				"port": config.HTTPTunnel.Port,
+			}))
 		}
 
 		config.UseProxy = true
@@ -59,7 +61,9 @@ func resolveDialConfigWithProxy(raw connection.ConnectionConfig) (connection.Con
 		}
 		forwardedSSH, err := buildProxyForwardAddress(normalizedProxy, strings.TrimSpace(config.SSH.Host), sshPort)
 		if err != nil {
-			return connection.ConnectionConfig{}, fmt.Errorf("代理连接 SSH 网关失败：%w", err)
+			return connection.ConnectionConfig{}, fmt.Errorf("%s", defaultAppText("db.backend.error.proxy_ssh_gateway_connect_failed", map[string]any{
+				"detail": err.Error(),
+			}))
 		}
 		config.SSH.Host = forwardedSSH.host
 		config.SSH.Port = forwardedSSH.port
@@ -128,7 +132,9 @@ func buildProxyForwardAddress(proxyConfig connection.ProxyConfig, targetHost str
 	}
 	port := targetPort
 	if port <= 0 {
-		return hostPort{}, fmt.Errorf("目标端口无效：%d", targetPort)
+		return hostPort{}, fmt.Errorf("%s", defaultAppText("db.backend.error.proxy_target_port_invalid", map[string]any{
+			"port": targetPort,
+		}))
 	}
 
 	forwarder, err := proxytunnel.GetOrCreateLocalForwarder(proxyConfig, host, port)
@@ -137,7 +143,9 @@ func buildProxyForwardAddress(proxyConfig connection.ProxyConfig, targetHost str
 	}
 	localHost, localPort, splitOK := parseAddressWithDefaultPort(forwarder.LocalAddr, 0)
 	if !splitOK || localPort <= 0 {
-		return hostPort{}, fmt.Errorf("解析代理本地转发地址失败：%s", forwarder.LocalAddr)
+		return hostPort{}, fmt.Errorf("%s", defaultAppText("db.backend.error.proxy_local_forward_addr_parse_failed", map[string]any{
+			"address": forwarder.LocalAddr,
+		}))
 	}
 	return hostPort{host: localHost, port: localPort}, nil
 }
@@ -203,16 +211,24 @@ func defaultPortByType(driverType string) int {
 	switch strings.ToLower(strings.TrimSpace(driverType)) {
 	case "mysql", "mariadb":
 		return 3306
+	case "goldendb", "greatdb", "gdb":
+		return 1523
+	case "oceanbase":
+		return 2881
 	case "diros":
+		return 9030
+	case "starrocks":
 		return 9030
 	case "sphinx":
 		return 9306
-	case "postgres", "vastbase":
+	case "postgres", "vastbase", "opengauss", "gaussdb":
 		return 5432
 	case "redis":
 		return 6379
 	case "tdengine":
 		return 6041
+	case "iotdb":
+		return 6667
 	case "oracle":
 		return 1521
 	case "dameng":
@@ -225,8 +241,18 @@ func defaultPortByType(driverType string) int {
 		return 27017
 	case "clickhouse":
 		return 9000
+	case "trino":
+		return 8080
 	case "highgo":
 		return 5866
+	case "iris":
+		return 1972
+	case "chroma":
+		return 8000
+	case "qdrant":
+		return 6333
+	case "kafka":
+		return 9092
 	default:
 		return 0
 	}

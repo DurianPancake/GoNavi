@@ -32,7 +32,7 @@ func NewGeminiProvider(config ai.ProviderConfig) (Provider, error) {
 	}
 	model := strings.TrimSpace(config.Model)
 	if model == "" {
-		return nil, fmt.Errorf("模型 ID 不能为空，请在设置中选择或输入模型")
+		return nil, fmt.Errorf("model ID is required; select or enter a model in Settings")
 	}
 	maxTokens := config.MaxTokens
 	if maxTokens <= 0 {
@@ -65,15 +65,15 @@ func (p *GeminiProvider) Name() string {
 
 func (p *GeminiProvider) Validate() error {
 	if strings.TrimSpace(p.config.APIKey) == "" {
-		return fmt.Errorf("API Key 不能为空")
+		return fmt.Errorf("API key is required")
 	}
 	return nil
 }
 
 type geminiRequest struct {
-	Contents         []geminiContent  `json:"contents"`
+	Contents          []geminiContent `json:"contents"`
 	SystemInstruction *geminiContent  `json:"systemInstruction,omitempty"`
-	GenerationConfig geminiGenConfig  `json:"generationConfig,omitempty"`
+	GenerationConfig  geminiGenConfig `json:"generationConfig,omitempty"`
 }
 
 type geminiContent struct {
@@ -132,13 +132,13 @@ func (p *GeminiProvider) Chat(ctx context.Context, req ai.ChatRequest) (*ai.Chat
 
 	var result geminiResponse
 	if err := json.NewDecoder(respBody).Decode(&result); err != nil {
-		return nil, fmt.Errorf("解析 Gemini 响应失败: %w", err)
+		return nil, fmt.Errorf("parse Gemini response failed: %w", err)
 	}
 	if result.Error != nil && result.Error.Message != "" {
-		return nil, fmt.Errorf("Gemini API 错误: %s", result.Error.Message)
+		return nil, fmt.Errorf("Gemini API error: %s", result.Error.Message)
 	}
 	if len(result.Candidates) == 0 || len(result.Candidates[0].Content.Parts) == 0 {
-		return nil, fmt.Errorf("Gemini 返回空响应")
+		return nil, fmt.Errorf("Gemini returned empty response")
 	}
 
 	var tokens ai.TokenUsage
@@ -228,7 +228,7 @@ func (p *GeminiProvider) buildRequest(req ai.ChatRequest) geminiRequest {
 		var parts []geminiPart
 		text := m.Content
 		if text == "" && len(m.Images) > 0 {
-			text = "请描述和分析这张图片。" // 同样避免 Gemini 认为意图不明确
+			text = providerImageFallbackPrompt(req.ImageFallbackPrompt) // 同样避免 Gemini 认为意图不明确
 		}
 		if text != "" {
 			parts = append(parts, geminiPart{Text: text})
@@ -255,7 +255,7 @@ func (p *GeminiProvider) buildRequest(req ai.ChatRequest) geminiRequest {
 		Contents:          contents,
 		SystemInstruction: systemInstruction,
 		GenerationConfig: geminiGenConfig{
-			Temperature:     temperature,
+			Temperature: temperature,
 		},
 	}
 }
@@ -263,12 +263,14 @@ func (p *GeminiProvider) buildRequest(req ai.ChatRequest) geminiRequest {
 func (p *GeminiProvider) doRequest(ctx context.Context, url string, body interface{}) (io.ReadCloser, error) {
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
-		return nil, fmt.Errorf("序列化请求失败: %w", err)
+		return nil, fmt.Errorf("serialize request failed: %w", err)
 	}
 
+	requestLog := logAIUpstreamRequestStart(p.Name(), http.MethodPost, url, body)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(jsonBody))
 	if err != nil {
-		return nil, fmt.Errorf("创建 HTTP 请求失败: %w", err)
+		logAIUpstreamRequestFinish(requestLog, 0, err)
+		return nil, fmt.Errorf("create HTTP request failed: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
@@ -280,14 +282,18 @@ func (p *GeminiProvider) doRequest(ctx context.Context, url string, body interfa
 
 	resp, err := p.client.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("发送请求到 Gemini 失败: %w", err)
+		logAIUpstreamRequestFinish(requestLog, 0, err)
+		return nil, fmt.Errorf("request to Gemini failed: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("Gemini API 返回错误 (HTTP %d): %s", resp.StatusCode, string(bodyBytes))
+		statusErr := fmt.Errorf("Gemini API returned error (HTTP %d): %s", resp.StatusCode, string(bodyBytes))
+		logAIUpstreamRequestFinish(requestLog, resp.StatusCode, statusErr)
+		return nil, statusErr
 	}
 
+	logAIUpstreamRequestFinish(requestLog, resp.StatusCode, nil)
 	return resp.Body, nil
 }

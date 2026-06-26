@@ -1,7 +1,6 @@
 package sync
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 )
@@ -19,18 +18,22 @@ type PreviewUpdateRow struct {
 }
 
 type TableDiffPreview struct {
-	Table        string             `json:"table"`
-	PKColumn     string             `json:"pkColumn"`
-	ColumnTypes  map[string]string  `json:"columnTypes,omitempty"`
-	TotalInserts int                `json:"totalInserts"`
-	TotalUpdates int                `json:"totalUpdates"`
-	TotalDeletes int                `json:"totalDeletes"`
-	Inserts      []PreviewRow       `json:"inserts"`
-	Updates      []PreviewUpdateRow `json:"updates"`
-	Deletes      []PreviewRow       `json:"deletes"`
+	Table            string             `json:"table"`
+	PKColumn         string             `json:"pkColumn"`
+	ColumnTypes      map[string]string  `json:"columnTypes,omitempty"`
+	SchemaSummary    string             `json:"schemaSummary,omitempty"`
+	SchemaWarnings   []string           `json:"schemaWarnings,omitempty"`
+	SchemaStatements []string           `json:"schemaStatements,omitempty"`
+	TotalInserts     int                `json:"totalInserts"`
+	TotalUpdates     int                `json:"totalUpdates"`
+	TotalDeletes     int                `json:"totalDeletes"`
+	Inserts          []PreviewRow       `json:"inserts"`
+	Updates          []PreviewUpdateRow `json:"updates"`
+	Deletes          []PreviewRow       `json:"deletes"`
 }
 
 func (s *SyncEngine) Preview(config SyncConfig, tableName string, limit int) (TableDiffPreview, error) {
+	config = normalizeSyncConnectionDatabases(config)
 	if limit <= 0 {
 		limit = 200
 	}
@@ -43,23 +46,26 @@ func (s *SyncEngine) Preview(config SyncConfig, tableName string, limit int) (Ta
 	if isMongoToRedisKeyspacePair(config) {
 		return s.previewMongoToRedis(config, tableName, limit)
 	}
+	if hasSourceQuery(config) {
+		return s.previewSourceQuery(config, limit)
+	}
 
 	sourceDB, err := newSyncDatabase(config.SourceConfig.Type)
 	if err != nil {
-		return TableDiffPreview{}, fmt.Errorf("初始化源数据库驱动失败: %w", err)
+		return TableDiffPreview{}, syncWrapDetailError("data_sync.backend.error.init_source_driver_failed", err)
 	}
 	targetDB, err := newSyncDatabase(config.TargetConfig.Type)
 	if err != nil {
-		return TableDiffPreview{}, fmt.Errorf("初始化目标数据库驱动失败: %w", err)
+		return TableDiffPreview{}, syncWrapDetailError("data_sync.backend.error.init_target_driver_failed", err)
 	}
 
 	if err := sourceDB.Connect(config.SourceConfig); err != nil {
-		return TableDiffPreview{}, fmt.Errorf("源数据库连接失败: %w", err)
+		return TableDiffPreview{}, syncWrapDetailError("data_sync.backend.error.connect_source_failed", err)
 	}
 	defer sourceDB.Close()
 
 	if err := targetDB.Connect(config.TargetConfig); err != nil {
-		return TableDiffPreview{}, fmt.Errorf("目标数据库连接失败: %w", err)
+		return TableDiffPreview{}, syncWrapDetailError("data_sync.backend.error.connect_target_failed", err)
 	}
 	defer targetDB.Close()
 
@@ -68,7 +74,20 @@ func (s *SyncEngine) Preview(config SyncConfig, tableName string, limit int) (Ta
 		return TableDiffPreview{}, err
 	}
 	if !plan.TargetTableExists && !plan.AutoCreate {
-		return TableDiffPreview{}, errors.New(firstNonEmpty(plan.PlannedAction, "目标表不存在，无法预览差异"))
+		return TableDiffPreview{}, syncTextError("data_sync.plan.target_missing_preview_unavailable", nil)
+	}
+	schemaStatements := make([]string, 0, len(plan.PreDataSQL)+len(plan.PostDataSQL))
+	schemaStatements = append(schemaStatements, plan.PreDataSQL...)
+	schemaStatements = append(schemaStatements, plan.PostDataSQL...)
+
+	contentRaw := strings.ToLower(strings.TrimSpace(config.Content))
+	if contentRaw == "schema" {
+		return TableDiffPreview{
+			Table:            tableName,
+			SchemaSummary:    firstNonEmpty(plan.PlannedAction, "仅同步结构"),
+			SchemaWarnings:   append([]string(nil), plan.Warnings...),
+			SchemaStatements: append([]string(nil), schemaStatements...),
+		}, nil
 	}
 
 	pkCols := make([]string, 0, 2)
@@ -78,21 +97,136 @@ func (s *SyncEngine) Preview(config SyncConfig, tableName string, limit int) (Ta
 		}
 	}
 	if len(pkCols) == 0 {
-		return TableDiffPreview{}, fmt.Errorf("无主键，不支持数据预览")
+		return TableDiffPreview{}, syncTextError("data_sync.backend.error.preview_pk_required", nil)
 	}
 	if len(pkCols) > 1 {
-		return TableDiffPreview{}, fmt.Errorf("复合主键（%s），暂不支持数据预览", strings.Join(pkCols, ","))
+		return TableDiffPreview{}, syncTextError("data_sync.backend.error.preview_composite_pk_unsupported", map[string]any{
+			"columns": strings.Join(pkCols, ","),
+		})
 	}
 	pkCol := pkCols[0]
 
-	sourceRows, _, err := sourceDB.Query(fmt.Sprintf("SELECT * FROM %s", quoteQualifiedIdentByType(resolveMigrationDBType(config.SourceConfig), plan.SourceQueryTable)))
+	sourceType := resolveMigrationDBType(config.SourceConfig)
+	targetType := resolveMigrationDBType(config.TargetConfig)
+	out := TableDiffPreview{
+		Table:            tableName,
+		PKColumn:         pkCol,
+		ColumnTypes:      make(map[string]string, len(cols)),
+		SchemaSummary:    firstNonEmpty(plan.PlannedAction, "结构预览"),
+		SchemaWarnings:   append([]string(nil), plan.Warnings...),
+		SchemaStatements: append([]string(nil), schemaStatements...),
+		TotalInserts:     0,
+		TotalUpdates:     0,
+		TotalDeletes:     0,
+		Inserts:          make([]PreviewRow, 0),
+		Updates:          make([]PreviewUpdateRow, 0),
+		Deletes:          make([]PreviewRow, 0),
+	}
+	for _, col := range cols {
+		name := strings.ToLower(strings.TrimSpace(col.Name))
+		typ := strings.TrimSpace(col.Type)
+		if name == "" || typ == "" {
+			continue
+		}
+		out.ColumnTypes[name] = typ
+	}
+
+	tableMode := normalizeSyncMode(config.Mode)
+	targetColSet := map[string]struct{}{}
+	if plan.TargetTableExists {
+		targetCols, err := targetDB.GetColumns(plan.TargetSchema, plan.TargetTable)
+		if err == nil {
+			targetColSet = buildTargetColumnSet(targetCols)
+		}
+	}
+
+	if !plan.TargetTableExists || tableMode != "insert_update" {
+		sourceCount, counted, err := countTableRowsForSync(sourceDB, sourceType, plan.SourceQueryTable)
+		if err != nil {
+			return TableDiffPreview{}, fmt.Errorf("读取源表数量失败: %w", err)
+		}
+		query := buildPagedSourceTableQuery(sourceType, plan.SourceQueryTable, cols, pkCol, limit, 0)
+		if strings.TrimSpace(query) == "" {
+			return TableDiffPreview{}, fmt.Errorf("当前数据源不支持分页预览")
+		}
+		sourceRows, _, err := sourceDB.Query(query)
+		if err != nil {
+			return TableDiffPreview{}, fmt.Errorf("读取源表失败: %w", err)
+		}
+		if !counted {
+			sourceCount = len(sourceRows)
+		}
+		out.TotalInserts = sourceCount
+		for _, row := range sourceRows {
+			if len(out.Inserts) >= limit {
+				break
+			}
+			pkVal := strings.TrimSpace(fmt.Sprintf("%v", row[pkCol]))
+			if pkVal == "" || pkVal == "<nil>" {
+				continue
+			}
+			out.Inserts = append(out.Inserts, PreviewRow{PK: pkVal, Row: row})
+		}
+		return out, nil
+	}
+
+	handled, _, err := scanTableDiffInPages(sourceDB, targetDB, sourceType, targetType, plan, cols, nil, pkCol, targetColSet, true, func(page pagedDiffPage) error {
+		out.TotalInserts += len(page.Inserts)
+		out.TotalUpdates += len(page.Updates)
+		out.TotalDeletes += len(page.Deletes)
+
+		for _, row := range page.Inserts {
+			if len(out.Inserts) >= limit {
+				break
+			}
+			pkVal := strings.TrimSpace(fmt.Sprintf("%v", row[pkCol]))
+			if pkVal == "" || pkVal == "<nil>" {
+				continue
+			}
+			out.Inserts = append(out.Inserts, PreviewRow{PK: pkVal, Row: row})
+		}
+		for _, update := range page.Updates {
+			if len(out.Updates) >= limit {
+				break
+			}
+			pkVal := strings.TrimSpace(fmt.Sprintf("%v", update.UpdateRow.Keys[pkCol]))
+			if pkVal == "" || pkVal == "<nil>" {
+				continue
+			}
+			out.Updates = append(out.Updates, PreviewUpdateRow{
+				PK:             pkVal,
+				ChangedColumns: append([]string(nil), update.ChangedColumns...),
+				Source:         update.Source,
+				Target:         update.Target,
+			})
+		}
+		for _, row := range page.Deletes {
+			if len(out.Deletes) >= limit {
+				break
+			}
+			pkVal := strings.TrimSpace(fmt.Sprintf("%v", row[pkCol]))
+			if pkVal == "" || pkVal == "<nil>" {
+				continue
+			}
+			out.Deletes = append(out.Deletes, PreviewRow{PK: pkVal, Row: row})
+		}
+		return nil
+	})
+	if handled {
+		if err != nil {
+			return TableDiffPreview{}, err
+		}
+		return out, nil
+	}
+
+	sourceRows, _, err := sourceDB.Query(fmt.Sprintf("SELECT * FROM %s", quoteQualifiedIdentByType(sourceType, plan.SourceQueryTable)))
 	if err != nil {
 		return TableDiffPreview{}, fmt.Errorf("读取源表失败: %w", err)
 	}
 
 	targetRows := make([]map[string]interface{}, 0)
 	if plan.TargetTableExists {
-		targetRows, _, err = targetDB.Query(fmt.Sprintf("SELECT * FROM %s", quoteQualifiedIdentByType(resolveMigrationDBType(config.TargetConfig), plan.TargetQueryTable)))
+		targetRows, _, err = targetDB.Query(fmt.Sprintf("SELECT * FROM %s", quoteQualifiedIdentByType(targetType, plan.TargetQueryTable)))
 		if err != nil {
 			return TableDiffPreview{}, fmt.Errorf("读取目标表失败: %w", err)
 		}
@@ -108,26 +242,6 @@ func (s *SyncEngine) Preview(config SyncConfig, tableName string, limit int) (Ta
 			continue
 		}
 		targetMap[pkVal] = row
-	}
-
-	out := TableDiffPreview{
-		Table:        tableName,
-		PKColumn:     pkCol,
-		ColumnTypes:  make(map[string]string, len(cols)),
-		TotalInserts: 0,
-		TotalUpdates: 0,
-		TotalDeletes: 0,
-		Inserts:      make([]PreviewRow, 0),
-		Updates:      make([]PreviewUpdateRow, 0),
-		Deletes:      make([]PreviewRow, 0),
-	}
-	for _, col := range cols {
-		name := strings.ToLower(strings.TrimSpace(col.Name))
-		typ := strings.TrimSpace(col.Type)
-		if name == "" || typ == "" {
-			continue
-		}
-		out.ColumnTypes[name] = typ
 	}
 
 	sourcePKSet := make(map[string]struct{}, len(sourceRows))

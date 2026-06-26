@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { getDataSourceCapabilities } from './dataSourceCapabilities';
+import { getDataSourceCapabilities, shouldShowOceanBaseRowNumberColumn } from './dataSourceCapabilities';
 
 describe('dataSourceCapabilities', () => {
   it('treats Oracle table preview totals as manual exact count plus approximate metadata count', () => {
@@ -27,6 +27,346 @@ describe('dataSourceCapabilities', () => {
       preferManualTotalCount: false,
       supportsApproximateTableCount: false,
       supportsApproximateTotalPages: false,
+    });
+  });
+
+  it('treats GoldenDB as an editable MySQL-family datasource with database-level DDL actions', () => {
+    expect(getDataSourceCapabilities({ type: 'goldendb' })).toMatchObject({
+      type: 'goldendb',
+      supportsQueryEditor: true,
+      supportsSqlQueryExport: true,
+      supportsCopyInsert: true,
+      supportsCreateDatabase: true,
+      supportsRenameDatabase: false,
+      supportsDropDatabase: true,
+      forceReadOnlyQueryResult: false,
+    });
+    expect(getDataSourceCapabilities({ type: 'custom', driver: 'greatdb' })).toMatchObject({
+      type: 'goldendb',
+      supportsQueryEditor: true,
+      supportsCopyInsert: true,
+    });
+  });
+
+  it('keeps StarRocks as an independent SQL datasource capability', () => {
+    expect(getDataSourceCapabilities({ type: 'starrocks' })).toMatchObject({
+      type: 'starrocks',
+      supportsQueryEditor: true,
+      supportsSqlQueryExport: true,
+      supportsCopyInsert: true,
+      preferManualTotalCount: false,
+    });
+  });
+
+  it('treats Trino as an editable SQL datasource without database-level DDL shortcuts', () => {
+    expect(getDataSourceCapabilities({ type: 'trino' })).toMatchObject({
+      type: 'trino',
+      supportsQueryEditor: true,
+      supportsSqlQueryExport: true,
+      supportsCopyInsert: true,
+      supportsCreateDatabase: false,
+      supportsRenameDatabase: false,
+      supportsDropDatabase: false,
+      forceReadOnlyQueryResult: false,
+    });
+  });
+
+  it('keeps InterSystems IRIS as an editable SQL datasource capability', () => {
+    expect(getDataSourceCapabilities({ type: 'iris' })).toMatchObject({
+      type: 'iris',
+      supportsQueryEditor: true,
+      supportsSqlQueryExport: true,
+      supportsCopyInsert: true,
+      forceReadOnlyQueryResult: false,
+    });
+    expect(getDataSourceCapabilities({ type: 'custom', driver: 'intersystemsiris' })).toMatchObject({
+      type: 'iris',
+      supportsQueryEditor: true,
+    });
+  });
+
+  it('treats GaussDB as an editable PostgreSQL-family datasource with database-level DDL actions', () => {
+    expect(getDataSourceCapabilities({ type: 'gaussdb' })).toMatchObject({
+      type: 'gaussdb',
+      supportsQueryEditor: true,
+      supportsSqlQueryExport: true,
+      supportsCopyInsert: true,
+      supportsCreateDatabase: true,
+      supportsRenameDatabase: true,
+      supportsDropDatabase: true,
+      forceReadOnlyQueryResult: false,
+    });
+    expect(getDataSourceCapabilities({ type: 'custom', driver: 'gauss-db' })).toMatchObject({
+      type: 'gaussdb',
+      supportsQueryEditor: true,
+      supportsCopyInsert: true,
+      supportsRenameDatabase: true,
+    });
+  });
+
+  it('treats Elasticsearch as a queryable read-only datasource', () => {
+    expect(getDataSourceCapabilities({ type: 'elasticsearch' })).toMatchObject({
+      type: 'elasticsearch',
+      supportsQueryEditor: true,
+      supportsSqlQueryExport: false,
+      supportsCopyInsert: false,
+      supportsCreateDatabase: false,
+      supportsRenameDatabase: false,
+      supportsDropDatabase: false,
+      forceReadOnlyQueryResult: false,
+    });
+    expect(getDataSourceCapabilities({ type: 'custom', driver: 'elastic' })).toMatchObject({
+      type: 'elasticsearch',
+      supportsQueryEditor: true,
+      forceReadOnlyQueryResult: false,
+    });
+  });
+
+  it('treats Chroma as a queryable vector datasource without SQL export actions', () => {
+    expect(getDataSourceCapabilities({ type: 'chroma' })).toMatchObject({
+      type: 'chroma',
+      supportsQueryEditor: true,
+      supportsSqlQueryExport: false,
+      supportsCopyInsert: false,
+      supportsCreateDatabase: false,
+      supportsRenameDatabase: false,
+      supportsDropDatabase: false,
+      forceReadOnlyQueryResult: false,
+    });
+    expect(getDataSourceCapabilities({ type: 'custom', driver: 'chromadb' })).toMatchObject({
+      type: 'chroma',
+      supportsQueryEditor: true,
+      supportsCopyInsert: false,
+    });
+  });
+
+  it('treats Qdrant as a queryable vector datasource without SQL export actions', () => {
+    expect(getDataSourceCapabilities({ type: 'qdrant' })).toMatchObject({
+      type: 'qdrant',
+      supportsQueryEditor: true,
+      supportsSqlQueryExport: false,
+      supportsCopyInsert: false,
+      supportsCreateDatabase: false,
+      supportsRenameDatabase: false,
+      supportsDropDatabase: false,
+      forceReadOnlyQueryResult: false,
+    });
+    expect(getDataSourceCapabilities({ type: 'custom', driver: 'qdrantdb' })).toMatchObject({
+      type: 'qdrant',
+      supportsQueryEditor: true,
+      supportsCopyInsert: false,
+    });
+  });
+
+  it('treats Apache IoTDB as a queryable timeseries datasource with IoTDB-specific writes', () => {
+    expect(getDataSourceCapabilities({ type: 'iotdb' })).toMatchObject({
+      type: 'iotdb',
+      supportsQueryEditor: true,
+      supportsSqlQueryExport: false,
+      supportsCopyInsert: false,
+      supportsCreateDatabase: false,
+      supportsRenameDatabase: false,
+      supportsDropDatabase: false,
+      forceReadOnlyQueryResult: true,
+    });
+    expect(getDataSourceCapabilities({ type: 'custom', driver: 'apache-iotdb' })).toMatchObject({
+      type: 'iotdb',
+      supportsQueryEditor: true,
+      supportsCopyInsert: false,
+      forceReadOnlyQueryResult: true,
+    });
+  });
+
+  it('treats RocketMQ as a queryable messaging datasource with manual total count and publish support', () => {
+    expect(getDataSourceCapabilities({ type: 'rocketmq' })).toMatchObject({
+      type: 'rocketmq',
+      supportsQueryEditor: true,
+      supportsSqlQueryExport: false,
+      supportsCopyInsert: false,
+      supportsCreateDatabase: false,
+      supportsRenameDatabase: false,
+      supportsDropDatabase: false,
+      supportsMessagePublish: true,
+      forceReadOnlyQueryResult: true,
+      preferManualTotalCount: true,
+    });
+    expect(getDataSourceCapabilities({ type: 'custom', driver: 'rmq' })).toMatchObject({
+      type: 'rocketmq',
+      supportsQueryEditor: true,
+      supportsMessagePublish: true,
+      forceReadOnlyQueryResult: true,
+      preferManualTotalCount: true,
+    });
+  });
+
+  it('treats MQTT as a queryable messaging datasource with manual total count and publish support', () => {
+    expect(getDataSourceCapabilities({ type: 'mqtt' })).toMatchObject({
+      type: 'mqtt',
+      supportsQueryEditor: true,
+      supportsSqlQueryExport: false,
+      supportsCopyInsert: false,
+      supportsCreateDatabase: false,
+      supportsRenameDatabase: false,
+      supportsDropDatabase: false,
+      supportsMessagePublish: true,
+      forceReadOnlyQueryResult: true,
+      preferManualTotalCount: true,
+    });
+    expect(getDataSourceCapabilities({ type: 'custom', driver: 'mqtts' })).toMatchObject({
+      type: 'mqtt',
+      supportsQueryEditor: true,
+      supportsMessagePublish: true,
+      preferManualTotalCount: true,
+    });
+  });
+
+  it('treats Kafka as a queryable read-only messaging datasource', () => {
+    expect(getDataSourceCapabilities({ type: 'kafka' })).toMatchObject({
+      type: 'kafka',
+      supportsQueryEditor: true,
+      supportsSqlQueryExport: false,
+      supportsCopyInsert: false,
+      supportsCreateDatabase: false,
+      supportsRenameDatabase: false,
+      supportsDropDatabase: false,
+      supportsMessagePublish: true,
+      forceReadOnlyQueryResult: true,
+    });
+    expect(getDataSourceCapabilities({ type: 'custom', driver: 'apache-kafka' })).toMatchObject({
+      type: 'kafka',
+      supportsQueryEditor: true,
+      supportsMessagePublish: true,
+      forceReadOnlyQueryResult: true,
+    });
+  });
+
+  it('forces supported SQL connections marked read-only into query-only mode', () => {
+    expect(getDataSourceCapabilities({ type: 'postgres', readOnly: true })).toMatchObject({
+      type: 'postgres',
+      supportsCreateDatabase: false,
+      supportsRenameDatabase: false,
+      supportsDropDatabase: false,
+      supportsMessagePublish: false,
+      forceReadOnlyQueryResult: true,
+      forceReadOnlyStructureDesigner: true,
+    });
+  });
+
+  it('allows script execution while still disabling result edits when only data-edit protection is enabled', () => {
+    expect(getDataSourceCapabilities({
+      type: 'postgres',
+      protection: {
+        restrictDataEdit: true,
+      },
+    })).toMatchObject({
+      type: 'postgres',
+      supportsCreateDatabase: true,
+      supportsRenameDatabase: true,
+      supportsDropDatabase: true,
+      forceReadOnlyQueryResult: true,
+      forceReadOnlyStructureDesigner: false,
+    });
+  });
+
+  it('keeps query results editable while disabling DDL shortcuts when only structure protection is enabled', () => {
+    expect(getDataSourceCapabilities({
+      type: 'postgres',
+      protection: {
+        restrictStructureEdit: true,
+      },
+    })).toMatchObject({
+      type: 'postgres',
+      supportsCreateDatabase: false,
+      supportsRenameDatabase: false,
+      supportsDropDatabase: false,
+      forceReadOnlyQueryResult: false,
+      forceReadOnlyStructureDesigner: true,
+    });
+  });
+
+  it('ignores readOnly for datasource types that do not support connection-level production guard', () => {
+    expect(getDataSourceCapabilities({ type: 'redis', readOnly: true })).toMatchObject({
+      type: 'redis',
+      supportsQueryEditor: false,
+      supportsCreateDatabase: false,
+      supportsDropDatabase: false,
+      forceReadOnlyQueryResult: false,
+      forceReadOnlyStructureDesigner: true,
+    });
+  });
+
+  it('treats RabbitMQ as a queryable messaging datasource with publish support', () => {
+    expect(getDataSourceCapabilities({ type: 'rabbitmq' })).toMatchObject({
+      type: 'rabbitmq',
+      supportsQueryEditor: true,
+      supportsSqlQueryExport: false,
+      supportsCopyInsert: false,
+      supportsCreateDatabase: false,
+      supportsRenameDatabase: false,
+      supportsDropDatabase: false,
+      supportsMessagePublish: true,
+      forceReadOnlyQueryResult: true,
+    });
+    expect(getDataSourceCapabilities({ type: 'custom', driver: 'rabbit-mq' })).toMatchObject({
+      type: 'rabbitmq',
+      supportsQueryEditor: true,
+      supportsMessagePublish: true,
+      forceReadOnlyQueryResult: true,
+    });
+  });
+
+  it('treats OceanBase Oracle protocol as Oracle capabilities', () => {
+    expect(getDataSourceCapabilities({
+      type: 'oceanbase',
+      oceanBaseProtocol: 'oracle',
+    })).toMatchObject({
+      type: 'oracle',
+      preferManualTotalCount: true,
+      supportsApproximateTableCount: true,
+    });
+  });
+
+  it('shows row numbers for OceanBase datasources regardless of protocol normalization', () => {
+    expect(shouldShowOceanBaseRowNumberColumn({ type: 'oceanbase' })).toBe(true);
+    expect(shouldShowOceanBaseRowNumberColumn({ type: 'oceanbase', oceanBaseProtocol: 'oracle' })).toBe(true);
+    expect(shouldShowOceanBaseRowNumberColumn({ type: 'custom', driver: 'oceanbase', oceanBaseProtocol: 'oracle' })).toBe(true);
+    expect(shouldShowOceanBaseRowNumberColumn({ type: 'oracle' })).toBe(false);
+    expect(shouldShowOceanBaseRowNumberColumn({ type: 'mysql' })).toBe(false);
+  });
+
+  it('treats custom OceanBase Oracle driver as Oracle capabilities', () => {
+    expect(getDataSourceCapabilities({
+      type: 'custom',
+      driver: 'oceanbase',
+      oceanBaseProtocol: 'oracle',
+    })).toMatchObject({
+      type: 'oracle',
+      preferManualTotalCount: true,
+      supportsApproximateTableCount: true,
+    });
+  });
+
+  it('hides database-level DDL actions for Dameng and Oracle-like datasources', () => {
+    expect(getDataSourceCapabilities({ type: 'dameng' })).toMatchObject({
+      type: 'dameng',
+      supportsCreateDatabase: false,
+      supportsRenameDatabase: false,
+      supportsDropDatabase: false,
+    });
+    expect(getDataSourceCapabilities({ type: 'oracle' })).toMatchObject({
+      type: 'oracle',
+      supportsCreateDatabase: false,
+      supportsRenameDatabase: false,
+      supportsDropDatabase: false,
+    });
+    expect(getDataSourceCapabilities({
+      type: 'oceanbase',
+      oceanBaseProtocol: 'oracle',
+    })).toMatchObject({
+      type: 'oracle',
+      supportsCreateDatabase: false,
+      supportsRenameDatabase: false,
+      supportsDropDatabase: false,
     });
   });
 });

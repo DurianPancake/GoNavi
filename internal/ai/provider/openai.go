@@ -33,7 +33,7 @@ func NewOpenAIProvider(config ai.ProviderConfig) (Provider, error) {
 	baseURL := NormalizeOpenAICompatibleBaseURL(config.BaseURL)
 	model := strings.TrimSpace(config.Model)
 	if model == "" {
-		return nil, fmt.Errorf("模型 ID 不能为空，请在设置中选择或输入模型")
+		return nil, fmt.Errorf("model ID is required; select or enter a model in Settings")
 	}
 	maxTokens := config.MaxTokens
 	if maxTokens <= 0 {
@@ -68,7 +68,7 @@ func (p *OpenAIProvider) Name() string {
 
 func (p *OpenAIProvider) Validate() error {
 	if strings.TrimSpace(p.config.APIKey) == "" {
-		return fmt.Errorf("API Key 不能为空")
+		return fmt.Errorf("API key is required")
 	}
 	return nil
 }
@@ -84,21 +84,25 @@ type openAIChatRequest struct {
 }
 
 type openAIChatMessage struct {
-	Role       string        `json:"role"`
-	Content    interface{}   `json:"content,omitempty"`
-	ToolCalls  []ai.ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string        `json:"tool_call_id,omitempty"`
+	Role             string        `json:"role"`
+	Content          interface{}   `json:"content,omitempty"`
+	ToolCalls        []ai.ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string        `json:"tool_call_id,omitempty"`
+	ReasoningContent string        `json:"reasoning_content,omitempty"`
 }
 
 func buildOpenAIMessages(reqMessages []ai.Message, modelName string, baseURL string) []openAIChatMessage {
 	messages := make([]openAIChatMessage, len(reqMessages))
+	replayReasoningContent := shouldReplayReasoningContent(modelName, baseURL)
 	for i, m := range reqMessages {
 		if m.Role == "tool" {
 			messages[i] = openAIChatMessage{Role: m.Role, Content: m.Content, ToolCallID: m.ToolCallID}
 			continue
 		}
 		if len(m.ToolCalls) > 0 {
-			messages[i] = openAIChatMessage{Role: m.Role, Content: m.Content, ToolCalls: m.ToolCalls}
+			msg := openAIChatMessage{Role: m.Role, Content: m.Content, ToolCalls: m.ToolCalls}
+			attachReasoningContent(&msg, m, replayReasoningContent)
+			messages[i] = msg
 			continue
 		}
 
@@ -106,7 +110,7 @@ func buildOpenAIMessages(reqMessages []ai.Message, modelName string, baseURL str
 			var contentParts []map[string]interface{}
 			text := m.Content
 			if text == "" {
-				text = "请描述和分析这张图片。" // 兼容部分模型（如 ZhipuAI/GLM-4V）强制要求图片必须伴随有效文本块，同时防止强 System Prompt 下模型当成空消息处理
+				text = providerImageFallbackPrompt("") // 兼容部分模型（如 ZhipuAI/GLM-4V）强制要求图片必须伴随有效文本块，同时防止强 System Prompt 下模型当成空消息处理
 			}
 			contentParts = append(contentParts, map[string]interface{}{
 				"type": "text",
@@ -127,20 +131,37 @@ func buildOpenAIMessages(reqMessages []ai.Message, modelName string, baseURL str
 					},
 				})
 			}
-			messages[i] = openAIChatMessage{Role: m.Role, Content: contentParts}
+			msg := openAIChatMessage{Role: m.Role, Content: contentParts}
+			attachReasoningContent(&msg, m, replayReasoningContent)
+			messages[i] = msg
 		} else {
-			messages[i] = openAIChatMessage{Role: m.Role, Content: m.Content}
+			msg := openAIChatMessage{Role: m.Role, Content: m.Content}
+			attachReasoningContent(&msg, m, replayReasoningContent)
+			messages[i] = msg
 		}
 	}
 	return messages
+}
+
+func attachReasoningContent(msg *openAIChatMessage, source ai.Message, enabled bool) {
+	if enabled && source.Role == "assistant" && source.ReasoningContent != "" {
+		msg.ReasoningContent = source.ReasoningContent
+	}
+}
+
+func shouldReplayReasoningContent(modelName string, baseURL string) bool {
+	model := strings.ToLower(strings.TrimSpace(modelName))
+	base := strings.ToLower(strings.TrimSpace(baseURL))
+	return strings.Contains(model, "deepseek") || strings.Contains(base, "deepseek")
 }
 
 // openAIChatResponse OpenAI API 响应体
 type openAIChatResponse struct {
 	Choices []struct {
 		Message struct {
-			Content   string        `json:"content"`
-			ToolCalls []ai.ToolCall `json:"tool_calls,omitempty"`
+			Content          string        `json:"content"`
+			ReasoningContent string        `json:"reasoning_content,omitempty"`
+			ToolCalls        []ai.ToolCall `json:"tool_calls,omitempty"`
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
@@ -184,7 +205,8 @@ func (p *OpenAIProvider) Chat(ctx context.Context, req ai.ChatRequest) (*ai.Chat
 		return nil, err
 	}
 
-	messages := buildOpenAIMessages(req.Messages, p.config.Model, p.baseURL)
+	requestMessages := prepareOpenAIRequestMessagesForRequest(req.Messages, p.config.Model, p.baseURL, req.ImageFallbackPrompt, req.ImageOmittedNotice)
+	messages := buildOpenAIMessages(requestMessages, p.config.Model, p.baseURL)
 
 	temperature := req.Temperature
 	if temperature <= 0 {
@@ -201,15 +223,8 @@ func (p *OpenAIProvider) Chat(ctx context.Context, req ai.ChatRequest) (*ai.Chat
 
 	respBody, err := p.doRequest(ctx, body)
 	if err != nil {
-		// 当带 tools 的请求返回 400 时，自动降级为不带 tools 的纯文本请求
-		if len(req.Tools) > 0 && isHTTP400Error(err) {
-			fmt.Println("[OpenAI] 模型不支持 Function Calling，自动降级为纯文本模式")
-			body.Tools = nil
-			respBody, err = p.doRequest(ctx, body)
-			if err != nil {
-				return nil, err
-			}
-		} else {
+		respBody, err = p.retryClientRejectedChatRequest(ctx, req, body, err)
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -217,17 +232,18 @@ func (p *OpenAIProvider) Chat(ctx context.Context, req ai.ChatRequest) (*ai.Chat
 
 	var result openAIChatResponse
 	if err := json.NewDecoder(respBody).Decode(&result); err != nil {
-		return nil, fmt.Errorf("解析 OpenAI 响应失败: %w", err)
+		return nil, fmt.Errorf("parse OpenAI response failed: %w", err)
 	}
 	if result.Error != nil && result.Error.Message != "" {
-		return nil, fmt.Errorf("OpenAI API 错误: %s", result.Error.Message)
+		return nil, fmt.Errorf("OpenAI API error: %s", result.Error.Message)
 	}
 	if len(result.Choices) == 0 {
-		return nil, fmt.Errorf("OpenAI 返回空响应")
+		return nil, fmt.Errorf("OpenAI returned empty response")
 	}
 
 	return &ai.ChatResponse{
-		Content: result.Choices[0].Message.Content,
+		Content:          result.Choices[0].Message.Content,
+		ReasoningContent: result.Choices[0].Message.ReasoningContent,
 		TokensUsed: ai.TokenUsage{
 			PromptTokens:     result.Usage.PromptTokens,
 			CompletionTokens: result.Usage.CompletionTokens,
@@ -242,7 +258,8 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, req ai.ChatRequest, cal
 		return err
 	}
 
-	messages := buildOpenAIMessages(req.Messages, p.config.Model, p.baseURL)
+	requestMessages := prepareOpenAIRequestMessagesForRequest(req.Messages, p.config.Model, p.baseURL, req.ImageFallbackPrompt, req.ImageOmittedNotice)
+	messages := buildOpenAIMessages(requestMessages, p.config.Model, p.baseURL)
 
 	temperature := req.Temperature
 	if temperature <= 0 {
@@ -259,15 +276,8 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, req ai.ChatRequest, cal
 
 	respBody, err := p.doRequest(ctx, body)
 	if err != nil {
-		// 当带 tools 的请求返回 400 时，自动降级为不带 tools 的纯文本请求
-		if len(req.Tools) > 0 && isHTTP400Error(err) {
-			fmt.Println("[OpenAI] 模型不支持 Function Calling，自动降级为纯文本模式")
-			body.Tools = nil
-			respBody, err = p.doRequest(ctx, body)
-			if err != nil {
-				return err
-			}
-		} else {
+		respBody, err = p.retryClientRejectedChatRequest(ctx, req, body, err)
+		if err != nil {
 			return err
 		}
 	}
@@ -287,7 +297,7 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, req ai.ChatRequest, cal
 		if !strings.HasPrefix(line, "data: ") {
 			// 非 SSE 数据行，可能是错误信息，记录日志
 			if strings.Contains(line, "error") || strings.Contains(line, "Error") {
-				callback(ai.StreamChunk{Error: fmt.Sprintf("服务端返回异常: %s", line), Done: true})
+				callback(ai.StreamChunk{Error: fmt.Sprintf("server returned abnormal response: %s", line), Done: true})
 				return nil
 			}
 			continue
@@ -303,7 +313,7 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, req ai.ChatRequest, cal
 			continue // 跳过格式异常的行
 		}
 		if chunk.Error != nil && chunk.Error.Message != "" {
-			callback(ai.StreamChunk{Error: fmt.Sprintf("API 错误: %s", chunk.Error.Message), Done: true})
+			callback(ai.StreamChunk{Error: fmt.Sprintf("API error: %s", chunk.Error.Message), Done: true})
 			return nil
 		}
 		if len(chunk.Choices) > 0 {
@@ -342,7 +352,10 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, req ai.ChatRequest, cal
 			// 支持 DeepSeek/千问等模型的 reasoning_content 字段
 			if choice.Delta.ReasoningContent != "" {
 				receivedContent = true
-				callback(ai.StreamChunk{Thinking: choice.Delta.ReasoningContent})
+				callback(ai.StreamChunk{
+					Thinking:         choice.Delta.ReasoningContent,
+					ReasoningContent: choice.Delta.ReasoningContent,
+				})
 			}
 
 			if choice.FinishReason != nil {
@@ -357,12 +370,12 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, req ai.ChatRequest, cal
 	}
 
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("读取 OpenAI 流式响应失败: %w", err)
+		return fmt.Errorf("read OpenAI streaming response failed: %w", err)
 	}
 
 	// 如果流正常结束但没有收到任何内容，可能是 API 响应格式不兼容
 	if !receivedContent {
-		callback(ai.StreamChunk{Error: "未收到任何有效响应内容，请检查 API 端点和模型是否正确", Done: true})
+		callback(ai.StreamChunk{Error: "no valid response content received; check the API endpoint and model configuration", Done: true})
 		return nil
 	}
 
@@ -370,16 +383,138 @@ func (p *OpenAIProvider) ChatStream(ctx context.Context, req ai.ChatRequest, cal
 	return nil
 }
 
+func (p *OpenAIProvider) retryClientRejectedChatRequest(ctx context.Context, req ai.ChatRequest, body openAIChatRequest, err error) (io.ReadCloser, error) {
+	if !isHTTP400Error(err) {
+		return nil, err
+	}
+
+	if len(body.Tools) > 0 {
+		fmt.Println("[OpenAI] 模型不支持 Function Calling，自动降级为纯文本模式")
+		body.Tools = nil
+		respBody, retryErr := p.doRequest(ctx, body)
+		if retryErr == nil {
+			return respBody, nil
+		}
+		if !isHTTP400Error(retryErr) {
+			return nil, retryErr
+		}
+		err = retryErr
+	}
+
+	if requestMessagesContainImages(req.Messages) {
+		fmt.Println("[OpenAI] 模型不支持图片输入，自动移除图片后重试")
+		body.Messages = buildOpenAIMessages(stripImagesFromRequestMessagesWithNotice(req.Messages, req.ImageOmittedNotice), p.config.Model, p.baseURL)
+		body.Tools = nil
+		respBody, retryErr := p.doRequest(ctx, body)
+		if retryErr == nil {
+			return respBody, nil
+		}
+		return nil, retryErr
+	}
+
+	return nil, err
+}
+
+func prepareOpenAIRequestMessages(messages []ai.Message, modelName string, baseURL string) []ai.Message {
+	return prepareOpenAIRequestMessagesForRequest(messages, modelName, baseURL, "", "")
+}
+
+func prepareOpenAIRequestMessagesWithImageFallback(messages []ai.Message, modelName string, baseURL string, imageFallbackPrompt string) []ai.Message {
+	return prepareOpenAIRequestMessagesForRequest(messages, modelName, baseURL, imageFallbackPrompt, "")
+}
+
+func prepareOpenAIRequestMessagesForRequest(messages []ai.Message, modelName string, baseURL string, imageFallbackPrompt string, imageOmittedNotice string) []ai.Message {
+	if requestMessagesContainImages(messages) && shouldOmitImagesBeforeRequest(modelName, baseURL) {
+		fmt.Println("[OpenAI] 当前模型按文本模型处理，发送前移除图片输入")
+		return stripImagesFromRequestMessagesWithNotice(messages, imageOmittedNotice)
+	}
+	return applyImageFallbackPrompt(messages, imageFallbackPrompt)
+}
+
+func shouldOmitImagesBeforeRequest(modelName string, baseURL string) bool {
+	model := strings.ToLower(strings.TrimSpace(modelName))
+	base := strings.ToLower(strings.TrimSpace(baseURL))
+	if model == "" {
+		return false
+	}
+
+	visionMarkers := []string{
+		"vision",
+		"vl",
+		"image",
+		"4v",
+		"omni",
+		"gpt-4o",
+		"gpt-4.1",
+		"gpt-5",
+		"glm-4v",
+	}
+	for _, marker := range visionMarkers {
+		if strings.Contains(model, marker) || strings.Contains(base, marker) {
+			return false
+		}
+	}
+
+	textOnlyMarkers := []string{
+		"minimax-m1",
+		"minimax-m2",
+		"kimi-k2",
+		"deepseek",
+		"moonshot-v1",
+	}
+	for _, marker := range textOnlyMarkers {
+		if strings.Contains(model, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func requestMessagesContainImages(messages []ai.Message) bool {
+	for _, message := range messages {
+		if len(message.Images) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func stripImagesFromRequestMessages(messages []ai.Message) []ai.Message {
+	return stripImagesFromRequestMessagesWithNotice(messages, "")
+}
+
+func stripImagesFromRequestMessagesWithNotice(messages []ai.Message, notice string) []ai.Message {
+	omittedImageNotice := providerImageOmittedNotice(notice)
+	stripped := make([]ai.Message, len(messages))
+	for i, message := range messages {
+		stripped[i] = message
+		if len(message.Images) == 0 {
+			continue
+		}
+
+		stripped[i].Images = nil
+		content := strings.TrimSpace(stripped[i].Content)
+		if content == "" {
+			stripped[i].Content = omittedImageNotice
+			continue
+		}
+		stripped[i].Content = content + "\n\n" + omittedImageNotice
+	}
+	return stripped
+}
+
 func (p *OpenAIProvider) doRequest(ctx context.Context, body interface{}) (io.ReadCloser, error) {
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
-		return nil, fmt.Errorf("序列化请求失败: %w", err)
+		return nil, fmt.Errorf("serialize request failed: %w", err)
 	}
 
 	url := ResolveOpenAICompatibleEndpoint(p.baseURL, "chat/completions")
+	requestLog := logAIUpstreamRequestStart(p.Name(), http.MethodPost, url, body)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(jsonBody))
 	if err != nil {
-		return nil, fmt.Errorf("创建 HTTP 请求失败: %w", err)
+		logAIUpstreamRequestFinish(requestLog, 0, err)
+		return nil, fmt.Errorf("create HTTP request failed: %w", err)
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -399,15 +534,19 @@ func (p *OpenAIProvider) doRequest(ctx context.Context, body interface{}) (io.Re
 
 	resp, err := p.client.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("发送请求到 %s 失败: %w", url, err)
+		logAIUpstreamRequestFinish(requestLog, 0, err)
+		return nil, fmt.Errorf("request to %s failed: %w", url, err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("OpenAI API 返回错误 (HTTP %d): %s", resp.StatusCode, string(bodyBytes))
+		statusErr := fmt.Errorf("OpenAI API returned error (HTTP %d): %s", resp.StatusCode, string(bodyBytes))
+		logAIUpstreamRequestFinish(requestLog, resp.StatusCode, statusErr)
+		return nil, statusErr
 	}
 
+	logAIUpstreamRequestFinish(requestLog, resp.StatusCode, nil)
 	return resp.Body, nil
 }
 

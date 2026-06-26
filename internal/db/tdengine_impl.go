@@ -5,8 +5,10 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -42,7 +44,14 @@ func (t *TDengineDB) getDSN(config connection.ConnectionConfig) string {
 	}
 
 	netType := resolveTDengineNet(config)
-	return fmt.Sprintf("%s:%s@%s(%s)%s", user, pass, netType, net.JoinHostPort(config.Host, strconv.Itoa(config.Port)), path)
+	params := url.Values{}
+	mergeConnectionParamsFromConfigWithAllowlist(params, config, tdengineConnectionParamNames, "taos", "taosws", "tdengine")
+	query := params.Encode()
+	dsn := fmt.Sprintf("%s:%s@%s(%s)%s", user, pass, netType, net.JoinHostPort(config.Host, strconv.Itoa(config.Port)), path)
+	if query == "" {
+		return dsn
+	}
+	return dsn + "?" + query
 }
 
 func (t *TDengineDB) Connect(config connection.ConnectionConfig) error {
@@ -87,6 +96,7 @@ func (t *TDengineDB) Connect(config connection.ConnectionConfig) error {
 			failures = append(failures, fmt.Sprintf("第%d次连接打开失败: %v", idx+1, err))
 			continue
 		}
+		configureSQLConnectionPool(db, "tdengine")
 		t.conn = db
 		t.pingTimeout = getConnectTimeout(attempt)
 
@@ -159,6 +169,24 @@ func (t *TDengineDB) Query(query string) ([]map[string]interface{}, []string, er
 	return scanRows(rows)
 }
 
+func (t *TDengineDB) StreamQueryContext(ctx context.Context, query string, consumer QueryStreamConsumer) error {
+	if t.conn == nil {
+		return fmt.Errorf("连接未打开")
+	}
+
+	rows, err := t.conn.QueryContext(ctx, query)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	return streamRows(rows, consumer)
+}
+
+func (t *TDengineDB) StreamQuery(query string, consumer QueryStreamConsumer) error {
+	return t.StreamQueryContext(context.Background(), query, consumer)
+}
+
 func (t *TDengineDB) ExecContext(ctx context.Context, query string) (int64, error) {
 	if t.conn == nil {
 		return 0, fmt.Errorf("连接未打开")
@@ -202,13 +230,11 @@ func (t *TDengineDB) GetDatabases() ([]string, error) {
 }
 
 func (t *TDengineDB) GetTables(dbName string) ([]string, error) {
-	queries := make([]string, 0, 2)
-	if strings.TrimSpace(dbName) != "" {
-		queries = append(queries, fmt.Sprintf("SHOW TABLES FROM `%s`", escapeBacktickIdent(dbName)))
-	}
-	queries = append(queries, "SHOW TABLES")
+	queries := tdengineShowTablesQueries(dbName)
 
 	var lastErr error
+	tableSet := make(map[string]struct{})
+	tables := make([]string, 0)
 	for _, query := range queries {
 		data, _, err := t.Query(query)
 		if err != nil {
@@ -216,17 +242,35 @@ func (t *TDengineDB) GetTables(dbName string) ([]string, error) {
 			continue
 		}
 
-		var tables []string
 		for _, row := range data {
 			if val, ok := getValueFromRow(row, "table_name", "tablename", "name", "Table", "table"); ok {
-				tables = append(tables, fmt.Sprintf("%v", val))
+				tableName := strings.TrimSpace(fmt.Sprintf("%v", val))
+				if tableName == "" {
+					continue
+				}
+				if _, exists := tableSet[tableName]; exists {
+					continue
+				}
+				tableSet[tableName] = struct{}{}
+				tables = append(tables, tableName)
 				continue
 			}
 			for _, val := range row {
-				tables = append(tables, fmt.Sprintf("%v", val))
+				tableName := strings.TrimSpace(fmt.Sprintf("%v", val))
+				if tableName == "" {
+					break
+				}
+				if _, exists := tableSet[tableName]; exists {
+					break
+				}
+				tableSet[tableName] = struct{}{}
+				tables = append(tables, tableName)
 				break
 			}
 		}
+	}
+	if len(tables) > 0 {
+		sort.Strings(tables)
 		return tables, nil
 	}
 
@@ -237,11 +281,7 @@ func (t *TDengineDB) GetTables(dbName string) ([]string, error) {
 }
 
 func (t *TDengineDB) GetCreateStatement(dbName, tableName string) (string, error) {
-	qualified := quoteTDengineTable(dbName, tableName)
-	queries := []string{
-		fmt.Sprintf("SHOW CREATE TABLE %s", qualified),
-		fmt.Sprintf("SHOW CREATE STABLE %s", qualified),
-	}
+	queries := tdengineCreateStatementQueries(dbName, tableName)
 
 	var lastErr error
 	for _, query := range queries {
@@ -274,13 +314,29 @@ func (t *TDengineDB) GetCreateStatement(dbName, tableName string) (string, error
 	if lastErr != nil {
 		return "", lastErr
 	}
-	return "", fmt.Errorf("未找到建表语句")
+	return "", errors.New(localizedDriverRuntimeText("db.backend.error.create_table_statement_not_found", nil))
 }
 
 func (t *TDengineDB) GetColumns(dbName, tableName string) ([]connection.ColumnDefinition, error) {
-	query := fmt.Sprintf("DESCRIBE %s", quoteTDengineTable(dbName, tableName))
-	data, _, err := t.Query(query)
+	var (
+		data    []map[string]interface{}
+		err     error
+		lastErr error
+	)
+	for _, query := range tdengineDescribeQueries(dbName, tableName) {
+		data, _, err = t.Query(query)
+		if err == nil {
+			break
+		}
+		lastErr = err
+		if !isTDengineSyntaxCompatibilityError(err) {
+			return nil, err
+		}
+	}
 	if err != nil {
+		if lastErr != nil {
+			return nil, lastErr
+		}
 		return nil, err
 	}
 
@@ -325,7 +381,7 @@ func (t *TDengineDB) GetColumns(dbName, tableName string) ([]connection.ColumnDe
 
 func (t *TDengineDB) GetAllColumns(dbName string) ([]connection.ColumnDefinitionWithTable, error) {
 	if strings.TrimSpace(dbName) == "" {
-		return nil, fmt.Errorf("获取全部列信息需要指定数据库名称")
+		return nil, localizedDatabaseRuntimeError("db.backend.error.database_name_required", nil)
 	}
 
 	tables, err := t.GetTables(dbName)
@@ -344,6 +400,7 @@ func (t *TDengineDB) GetAllColumns(dbName string) ([]connection.ColumnDefinition
 				TableName: table,
 				Name:      col.Name,
 				Type:      col.Type,
+				Comment:   col.Comment,
 			})
 		}
 	}
@@ -365,29 +422,34 @@ func (t *TDengineDB) GetTriggers(dbName, tableName string) ([]connection.Trigger
 
 func (t *TDengineDB) ApplyChanges(tableName string, changes connection.ChangeSet) error {
 	if t.conn == nil {
-		return fmt.Errorf("连接未打开")
+		return localizedDatabaseRuntimeError("db.backend.error.connection_not_open", nil)
 	}
 	if strings.TrimSpace(tableName) == "" {
-		return fmt.Errorf("表名不能为空")
+		return localizedDatabaseRuntimeError("db.backend.error.table_name_required", nil)
 	}
 	if len(changes.Updates) > 0 || len(changes.Deletes) > 0 {
-		return fmt.Errorf("TDengine 目标端当前仅支持 INSERT 写入，暂不支持 UPDATE/DELETE 差异同步，请改用仅插入或全量覆盖模式")
+		return localizedDatabaseRuntimeError("db.backend.error.tdengine_apply_changes_insert_only", nil)
 	}
 
 	qualifiedTable := quoteTDengineTable("", tableName)
-	for _, row := range changes.Inserts {
-		query, err := buildTDengineInsertSQL(qualifiedTable, row)
-		if err != nil {
-			return err
-		}
-		if query == "" {
-			continue
-		}
-		if _, err := t.conn.Exec(query); err != nil {
-			return fmt.Errorf("插入失败：%v; sql=%s", err, query)
-		}
+	return execTDengineInsertBatches(t.conn, qualifiedTable, changes.Inserts)
+}
+
+func execTDengineInsertBatches(conn *sql.DB, qualifiedTable string, rows []map[string]interface{}) error {
+	if conn == nil {
+		return fmt.Errorf("连接未打开")
 	}
-	return nil
+	return execLiteralInsertBatches(literalInsertConfig{
+		Table: qualifiedTable,
+		Rows:  rows,
+		QuoteColumn: func(column string) string {
+			return fmt.Sprintf("`%s`", escapeBacktickIdent(column))
+		},
+		Literal: tdengineLiteral,
+		Exec: func(query string) (sql.Result, error) {
+			return conn.Exec(query)
+		},
+	})
 }
 
 func buildTDengineInsertSQL(qualifiedTable string, row map[string]interface{}) (string, error) {
@@ -464,6 +526,106 @@ func getValueFromRow(row map[string]interface{}, keys ...string) (interface{}, b
 
 func escapeBacktickIdent(ident string) string {
 	return strings.ReplaceAll(strings.TrimSpace(ident), "`", "``")
+}
+
+func tdengineShowTablesQueries(dbName string) []string {
+	queries := make([]string, 0, 6)
+	appendQuery := func(query string) {
+		query = strings.TrimSpace(query)
+		if query == "" {
+			return
+		}
+		for _, existing := range queries {
+			if existing == query {
+				return
+			}
+		}
+		queries = append(queries, query)
+	}
+
+	db := strings.TrimSpace(dbName)
+	if db != "" {
+		escaped := escapeBacktickIdent(db)
+		appendQuery(fmt.Sprintf("SHOW TABLES FROM `%s`", escaped))
+		appendQuery(fmt.Sprintf("SHOW STABLES FROM `%s`", escaped))
+		appendQuery(fmt.Sprintf("SHOW TABLES FROM %s", db))
+		appendQuery(fmt.Sprintf("SHOW STABLES FROM %s", db))
+	}
+
+	appendQuery("SHOW TABLES")
+	appendQuery("SHOW STABLES")
+	return queries
+}
+
+func tdengineDescribeQueries(dbName, tableName string) []string {
+	qualified := quoteTDengineTable(dbName, tableName)
+	legacyQualified := quoteTDengineTableLegacy(dbName, tableName)
+	queries := []string{fmt.Sprintf("DESCRIBE %s", qualified)}
+	if legacyQualified != qualified {
+		queries = append(queries, fmt.Sprintf("DESCRIBE %s", legacyQualified))
+	}
+	return queries
+}
+
+func tdengineCreateStatementQueries(dbName, tableName string) []string {
+	queries := make([]string, 0, 4)
+	appendQualifiedQueries := func(qualified string) {
+		if strings.TrimSpace(qualified) == "" {
+			return
+		}
+		queries = append(queries,
+			fmt.Sprintf("SHOW CREATE TABLE %s", qualified),
+			fmt.Sprintf("SHOW CREATE STABLE %s", qualified),
+		)
+	}
+	qualified := quoteTDengineTable(dbName, tableName)
+	appendQualifiedQueries(qualified)
+	legacyQualified := quoteTDengineTableLegacy(dbName, tableName)
+	if legacyQualified != qualified {
+		appendQualifiedQueries(legacyQualified)
+	}
+	return queries
+}
+
+func quoteTDengineTableLegacy(dbName, tableName string) string {
+	table := strings.TrimSpace(tableName)
+	if table == "" {
+		return ""
+	}
+	if strings.Contains(table, ".") {
+		return strings.Join(splitTDengineIdentifierParts(table), ".")
+	}
+	db := strings.TrimSpace(dbName)
+	if db == "" {
+		return table
+	}
+	return db + "." + table
+}
+
+func splitTDengineIdentifierParts(path string) []string {
+	parts := strings.Split(strings.TrimSpace(path), ".")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.Trim(strings.TrimSpace(part), "`")
+		if trimmed == "" {
+			continue
+		}
+		result = append(result, trimmed)
+	}
+	return result
+}
+
+func isTDengineSyntaxCompatibilityError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(strings.TrimSpace(err.Error()))
+	if text == "" {
+		return false
+	}
+	return strings.Contains(text, "syntax error near") ||
+		strings.Contains(text, "[0x2600]") ||
+		errors.Is(err, sql.ErrNoRows)
 }
 
 func quoteTDengineTable(dbName, tableName string) string {

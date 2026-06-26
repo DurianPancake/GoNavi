@@ -38,6 +38,7 @@ GoNavi 面向开发者与 DBA，核心目标是让数据库操作在桌面端做
 | 缓存 | Redis | 内置 | Key 浏览、命令执行、编码/视图切换 |
 | 关系型 | MariaDB | 可选驱动代理 | 连接查询、对象管理、数据编辑 |
 | 关系型 | Doris | 可选驱动代理 | 连接查询、对象浏览、SQL 执行 |
+| 列式分析 | StarRocks | 可选驱动代理 | 连接查询、对象浏览、SQL 执行 |
 | 搜索 | Sphinx | 可选驱动代理 | SphinxQL 查询与对象浏览 |
 | 关系型 | SQL Server | 可选驱动代理 | 库表浏览、SQL 查询、对象管理 |
 | 文件型 | SQLite | 可选驱动代理 | 本地文件库浏览、编辑、导出 |
@@ -49,6 +50,8 @@ GoNavi 面向开发者与 DBA，核心目标是让数据库操作在桌面端做
 | 文档型 | MongoDB | 可选驱动代理 | 文档查询、集合浏览、连接管理 |
 | 时序 | TDengine | 可选驱动代理 | 时序库表浏览、查询分析 |
 | 列式分析 | ClickHouse | 可选驱动代理 | 分析查询、对象浏览、SQL 执行 |
+| 联邦查询 | Trino | 可选驱动代理 | 跨多数据源联邦 SQL、`catalog.schema` 浏览、SQL 执行 |
+| 搜索 | Elasticsearch | 可选驱动代理 | 索引浏览、Mapping 检查、JSON DSL / query_string 查询 |
 | 扩展接入 | Custom Driver/DSN | 自定义 | 通过 Driver + DSN 接入更多数据源 |
 
 <h2 align="center">📸 项目截图</h2>
@@ -126,17 +129,26 @@ GoNavi 面向开发者与 DBA，核心目标是让数据库操作在桌面端做
 - [Go](https://go.dev/dl/) 1.21+
 - [Node.js](https://nodejs.org/) 18+
 - [Wails CLI](https://wails.io/docs/gettingstarted/installation):
-  `go install github.com/wailsapp/wails/v2/cmd/wails@latest`
+  `go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0`
 
 ### 开发模式
 
-```bash
+```shell
 # 克隆项目
 git clone https://github.com/Syngnat/GoNavi.git
 cd GoNavi
 
 # 启动开发（热重载）
 wails dev
+
+# 本地快速启动：未修改 Go 导出方法签名时使用
+node tools/wails-fast-dev.mjs
+
+# 修改 Go 导出方法签名后刷新 Wails JS 绑定
+node tools/wails-fast-dev.mjs --refresh-bindings
+
+# Windows PowerShell 低内存视觉模式：关闭透明 WebView 和 Acrylic 背景
+$env:GONAVI_LOW_MEMORY_MODE="1"; node tools/wails-fast-dev.mjs
 ```
 
 ### 编译构建
@@ -185,6 +197,16 @@ sudo apt-get update
 sudo apt-get install -y libgtk-3-0 libwebkit2gtk-4.0-37 libjavascriptcoregtk-4.0-18
 ```
 
+### Linux 中文显示为方框
+
+Ubuntu 24.04 LTS 的最小化桌面或服务器环境可能没有安装中文 CJK 字体，GoNavi 打开后中文会显示为方框。安装 Noto / 文泉驿字体后重启 GoNavi：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y fonts-noto-cjk fonts-wqy-microhei
+fc-cache -fv
+```
+
 ---
 
 ## 贡献指南
@@ -195,7 +217,7 @@ sudo apt-get install -y libgtk-3-0 libwebkit2gtk-4.0-37 libjavascriptcoregtk-4.0
 
 - [CONTRIBUTING.zh-CN.md](CONTRIBUTING.zh-CN.md)
 
-外部贡献者统一直接向 `main` 发起 Pull Request。
+外部贡献者应从 `dev` 拉出分支，并统一向 `dev` 发起 Pull Request。
 
 ## Star History (Star 增长趋势)
 

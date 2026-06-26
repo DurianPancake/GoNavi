@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	"GoNavi-Wails/internal/connection"
 	"GoNavi-Wails/internal/logger"
 )
 
@@ -102,4 +103,122 @@ func getDamengRowString(row map[string]interface{}, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func buildDamengColumnsQuery(dbName, tableName string) string {
+	upperTableName := strings.ToUpper(strings.TrimSpace(tableName))
+	upperDBName := strings.ToUpper(strings.TrimSpace(dbName))
+
+	if upperDBName == "" {
+		return fmt.Sprintf(`SELECT c.column_name, c.data_type, c.data_length, c.char_length, c.data_precision, c.data_scale, c.nullable, c.data_default,
+		CASE WHEN pk.column_name IS NOT NULL THEN 'PRI' ELSE '' END AS column_key
+		FROM user_tab_columns c
+		LEFT JOIN (
+			SELECT cols.table_name, cols.column_name
+			FROM user_constraints cons
+			JOIN user_cons_columns cols USING (constraint_name)
+			WHERE cons.constraint_type = 'P'
+		) pk ON c.table_name = pk.table_name AND c.column_name = pk.column_name
+		WHERE c.table_name = '%s'
+		ORDER BY c.column_id`, upperTableName)
+	}
+
+	return fmt.Sprintf(`SELECT c.column_name, c.data_type, c.data_length, c.char_length, c.data_precision, c.data_scale, c.nullable, c.data_default,
+		CASE WHEN pk.column_name IS NOT NULL THEN 'PRI' ELSE '' END AS column_key
+		FROM all_tab_columns c
+		LEFT JOIN (
+			SELECT cols.owner, cols.table_name, cols.column_name
+			FROM all_constraints cons
+			JOIN all_cons_columns cols
+			  ON cons.owner = cols.owner AND cons.constraint_name = cols.constraint_name
+			WHERE cons.constraint_type = 'P'
+		) pk ON c.owner = pk.owner AND c.table_name = pk.table_name AND c.column_name = pk.column_name
+		WHERE c.owner = '%s' AND c.table_name = '%s'
+		ORDER BY c.column_id`, upperDBName, upperTableName)
+}
+
+func getDamengRowInt(row map[string]interface{}, keys ...string) (int, bool) {
+	for _, key := range keys {
+		raw := getDamengRowString(row, key)
+		if raw == "" {
+			continue
+		}
+		var parsed int
+		if _, err := fmt.Sscanf(raw, "%d", &parsed); err == nil {
+			return parsed, true
+		}
+	}
+	return 0, false
+}
+
+func normalizeDamengNullable(value string) string {
+	switch strings.ToUpper(strings.TrimSpace(value)) {
+	case "N", "NO", "FALSE", "0", "NOT NULL":
+		return "NO"
+	case "Y", "YES", "TRUE", "1", "NULL", "NULLABLE":
+		return "YES"
+	default:
+		return strings.TrimSpace(value)
+	}
+}
+
+func isDamengLengthQualifiedType(upperType string) bool {
+	switch strings.TrimSpace(upperType) {
+	case "CHAR", "NCHAR", "VARCHAR", "VARCHAR2", "NVARCHAR", "NVARCHAR2", "RAW", "BINARY", "VARBINARY":
+		return true
+	default:
+		return strings.Contains(upperType, "CHARACTER")
+	}
+}
+
+func formatDamengColumnType(row map[string]interface{}) string {
+	dataType := getDamengRowString(row, "DATA_TYPE")
+	if dataType == "" || strings.Contains(dataType, "(") {
+		return dataType
+	}
+
+	upperType := strings.ToUpper(dataType)
+	if isDamengLengthQualifiedType(upperType) {
+		if charLength, ok := getDamengRowInt(row, "CHAR_LENGTH", "CHAR_COL_DECL_LENGTH"); ok && charLength > 0 {
+			return fmt.Sprintf("%s(%d)", dataType, charLength)
+		}
+		if dataLength, ok := getDamengRowInt(row, "DATA_LENGTH"); ok && dataLength > 0 {
+			return fmt.Sprintf("%s(%d)", dataType, dataLength)
+		}
+	}
+
+	if strings.Contains(upperType, "NUMBER") || strings.Contains(upperType, "DECIMAL") || strings.Contains(upperType, "NUMERIC") {
+		precision, hasPrecision := getDamengRowInt(row, "DATA_PRECISION", "NUMERIC_PRECISION")
+		if hasPrecision && precision > 0 {
+			scale, hasScale := getDamengRowInt(row, "DATA_SCALE", "NUMERIC_SCALE")
+			if hasScale && scale > 0 {
+				return fmt.Sprintf("%s(%d,%d)", dataType, precision, scale)
+			}
+			return fmt.Sprintf("%s(%d)", dataType, precision)
+		}
+	}
+
+	return dataType
+}
+
+func buildDamengColumnDefinitions(data []map[string]interface{}) []connection.ColumnDefinition {
+	columns := make([]connection.ColumnDefinition, 0, len(data))
+	for _, row := range data {
+		col := connection.ColumnDefinition{
+			Name:     getDamengRowString(row, "COLUMN_NAME"),
+			Type:     formatDamengColumnType(row),
+			Nullable: normalizeDamengNullable(getDamengRowString(row, "NULLABLE")),
+			Key:      getDamengRowString(row, "COLUMN_KEY"),
+		}
+
+		defaultValue := getDamengRowString(row, "DATA_DEFAULT")
+		if defaultValue != "" {
+			def := defaultValue
+			col.Default = &def
+		}
+
+		columns = append(columns, col)
+	}
+
+	return columns
 }

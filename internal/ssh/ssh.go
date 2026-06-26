@@ -116,6 +116,22 @@ func RegisterSSHNetwork(sshConfig connection.SSHConfig) (string, error) {
 	return netName, nil
 }
 
+// DialContextThroughSSH creates a context-aware connection through an SSH tunnel.
+func DialContextThroughSSH(ctx context.Context, config connection.SSHConfig, network, address string) (net.Conn, error) {
+	client, err := GetOrCreateSSHClient(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to establish SSH connection: %w", err)
+	}
+
+	conn, err := dialContext(ctx, client, network, address)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to %s through SSH tunnel: %w", address, err)
+	}
+
+	logger.Infof("已通过 SSH 隧道连接到：%s", address)
+	return conn, nil
+}
+
 // sshClientCache stores SSH clients to avoid creating multiple connections
 var (
 	sshClientCache   = make(map[sshClientCacheKey]*ssh.Client)
@@ -187,13 +203,13 @@ type LocalForwarder struct {
 func NewLocalForwarder(sshConfig connection.SSHConfig, remoteHost string, remotePort int) (*LocalForwarder, error) {
 	client, err := GetOrCreateSSHClient(sshConfig)
 	if err != nil {
-		return nil, fmt.Errorf("建立 SSH 连接失败：%w", err)
+		return nil, fmt.Errorf("failed to establish SSH connection: %w", err)
 	}
 
 	// Listen on localhost with a random port
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return nil, fmt.Errorf("创建本地监听器失败：%w", err)
+		return nil, fmt.Errorf("failed to create local listener: %w", err)
 	}
 
 	localAddr := listener.Addr().String()
@@ -394,12 +410,12 @@ func GetOrCreateSSHClient(config connection.SSHConfig) (*ssh.Client, error) {
 func DialThroughSSH(config connection.SSHConfig, network, address string) (net.Conn, error) {
 	client, err := GetOrCreateSSHClient(config)
 	if err != nil {
-		return nil, fmt.Errorf("建立 SSH 连接失败：%w", err)
+		return nil, fmt.Errorf("failed to establish SSH connection: %w", err)
 	}
 
 	conn, err := client.Dial(network, address)
 	if err != nil {
-		return nil, fmt.Errorf("通过 SSH 隧道连接到 %s 失败：%w", address, err)
+		return nil, fmt.Errorf("failed to connect to %s through SSH tunnel: %w", address, err)
 	}
 
 	logger.Infof("已通过 SSH 隧道连接到：%s", address)

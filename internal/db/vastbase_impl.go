@@ -42,7 +42,9 @@ func (v *VastbaseDB) getDSN(config connection.ConnectionConfig) string {
 	u.User = url.UserPassword(config.User, config.Password)
 	q := url.Values{}
 	q.Set("sslmode", resolvePostgresSSLMode(config))
+	applyPostgresSSLPathParams(q, config)
 	q.Set("connect_timeout", strconv.Itoa(getConnectTimeoutSeconds(config)))
+	mergeConnectionParamsFromConfigWithAllowlist(q, config, postgresConnectionParamNames, "postgres", "postgresql", "vastbase")
 	u.RawQuery = q.Encode()
 
 	return u.String()
@@ -92,6 +94,7 @@ func (v *VastbaseDB) Connect(config connection.ConnectionConfig) error {
 			failures = append(failures, fmt.Sprintf("第%d次连接打开失败: %v", idx+1, err))
 			continue
 		}
+		configureSQLConnectionPool(db, "vastbase")
 		v.conn = db
 		v.pingTimeout = getConnectTimeout(attempt)
 		if err := v.Ping(); err != nil {
@@ -173,6 +176,28 @@ func (v *VastbaseDB) ExecContext(ctx context.Context, query string) (int64, erro
 	return res.RowsAffected()
 }
 
+func (v *VastbaseDB) ExecBatchContext(ctx context.Context, query string) (int64, error) {
+	if v.conn == nil {
+		return 0, fmt.Errorf("连接未打开")
+	}
+	res, err := v.conn.ExecContext(ctx, query)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (v *VastbaseDB) OpenSessionExecer(ctx context.Context) (StatementExecer, error) {
+	if v.conn == nil {
+		return nil, fmt.Errorf("连接未打开")
+	}
+	conn, err := v.conn.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return NewSQLConnStatementExecer(conn), nil
+}
+
 func (v *VastbaseDB) Exec(query string) (int64, error) {
 	if v.conn == nil {
 		return 0, fmt.Errorf("连接未打开")
@@ -199,7 +224,7 @@ func (v *VastbaseDB) GetDatabases() ([]string, error) {
 }
 
 func (v *VastbaseDB) GetTables(dbName string) ([]string, error) {
-	query := "SELECT schemaname, tablename FROM pg_catalog.pg_tables WHERE schemaname != 'information_schema' AND schemaname NOT LIKE 'pg_%' ORDER BY schemaname, tablename"
+	query := "SELECT schemaname, tablename FROM pg_catalog.pg_tables WHERE schemaname != 'information_schema' AND schemaname NOT LIKE 'pg|_%' ESCAPE '|' ORDER BY schemaname, tablename"
 	data, _, err := v.Query(query)
 	if err != nil {
 		return nil, err
@@ -225,178 +250,31 @@ func (v *VastbaseDB) GetCreateStatement(dbName, tableName string) (string, error
 }
 
 func (v *VastbaseDB) GetColumns(dbName, tableName string) ([]connection.ColumnDefinition, error) {
-	schema := strings.TrimSpace(dbName)
-	if schema == "" {
-		schema = "public"
-	}
-	table := strings.TrimSpace(tableName)
+	schema, table := normalizePGLikeMetadataTable(dbName, tableName)
 	if table == "" {
-		return nil, fmt.Errorf("表名不能为空")
+		return nil, localizedDatabaseRuntimeError("db.backend.error.table_name_required", nil)
 	}
 
-	esc := func(s string) string { return strings.ReplaceAll(s, "'", "''") }
-
-	query := fmt.Sprintf(`
-SELECT
-	a.attname AS column_name,
-	pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
-	CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable,
-	pg_get_expr(ad.adbin, ad.adrelid) AS column_default,
-	col_description(a.attrelid, a.attnum) AS comment,
-	CASE WHEN pk.attname IS NOT NULL THEN 'PRI' ELSE '' END AS column_key
-FROM pg_class c
-JOIN pg_namespace n ON n.oid = c.relnamespace
-JOIN pg_attribute a ON a.attrelid = c.oid
-LEFT JOIN pg_attrdef ad ON ad.adrelid = c.oid AND ad.adnum = a.attnum
-LEFT JOIN (
-	SELECT i.indrelid, a3.attname
-	FROM pg_index i
-	JOIN pg_attribute a3 ON a3.attrelid = i.indrelid AND a3.attnum = ANY(i.indkey)
-	WHERE i.indisprimary
-) pk ON pk.indrelid = c.oid AND pk.attname = a.attname
-WHERE c.relkind IN ('r', 'p')
-  AND n.nspname = '%s'
-  AND c.relname = '%s'
-  AND a.attnum > 0
-  AND NOT a.attisdropped
-ORDER BY a.attnum`, esc(schema), esc(table))
-
-	data, _, err := v.Query(query)
+	data, _, err := v.Query(buildPGLikeColumnsMetadataQuery(schema, table))
 	if err != nil {
 		return nil, err
 	}
 
-	var columns []connection.ColumnDefinition
-	for _, row := range data {
-		col := connection.ColumnDefinition{
-			Name:     fmt.Sprintf("%v", row["column_name"]),
-			Type:     fmt.Sprintf("%v", row["data_type"]),
-			Nullable: fmt.Sprintf("%v", row["is_nullable"]),
-			Key:      fmt.Sprintf("%v", row["column_key"]),
-			Extra:    "",
-			Comment:  "",
-		}
-
-		if val, ok := row["comment"]; ok && val != nil {
-			col.Comment = fmt.Sprintf("%v", val)
-		}
-
-		if val, ok := row["column_default"]; ok && val != nil {
-			def := fmt.Sprintf("%v", val)
-			col.Default = &def
-			if strings.HasPrefix(strings.ToLower(strings.TrimSpace(def)), "nextval(") {
-				col.Extra = "auto_increment"
-			}
-		}
-
-		columns = append(columns, col)
-	}
-	return columns, nil
+	return buildPGLikeColumnDefinitions(data), nil
 }
 
 func (v *VastbaseDB) GetIndexes(dbName, tableName string) ([]connection.IndexDefinition, error) {
-	schema := strings.TrimSpace(dbName)
-	if schema == "" {
-		schema = "public"
-	}
-	table := strings.TrimSpace(tableName)
+	schema, table := normalizePGLikeMetadataTable(dbName, tableName)
 	if table == "" {
-		return nil, fmt.Errorf("表名不能为空")
+		return nil, localizedDatabaseRuntimeError("db.backend.error.table_name_required", nil)
 	}
 
-	esc := func(s string) string { return strings.ReplaceAll(s, "'", "''") }
-
-	query := fmt.Sprintf(`
-SELECT
-	i.relname AS index_name,
-	a.attname AS column_name,
-	ix.indisunique AS is_unique,
-	x.ordinality AS seq_in_index,
-	am.amname AS index_type
-FROM pg_class t
-JOIN pg_namespace n ON n.oid = t.relnamespace
-JOIN pg_index ix ON t.oid = ix.indrelid
-JOIN pg_class i ON i.oid = ix.indexrelid
-JOIN pg_am am ON i.relam = am.oid
-JOIN unnest(ix.indkey) WITH ORDINALITY AS x(attnum, ordinality) ON TRUE
-JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = x.attnum
-WHERE t.relkind IN ('r', 'p')
-  AND t.relname = '%s'
-  AND n.nspname = '%s'
-ORDER BY i.relname, x.ordinality`, esc(table), esc(schema))
-
-	data, _, err := v.Query(query)
+	data, _, err := v.Query(buildPGLikeIndexesMetadataQuery(schema, table))
 	if err != nil {
 		return nil, err
 	}
 
-	parseBool := func(val interface{}) bool {
-		switch v := val.(type) {
-		case bool:
-			return v
-		case string:
-			s := strings.ToLower(strings.TrimSpace(v))
-			return s == "t" || s == "true" || s == "1" || s == "y" || s == "yes"
-		default:
-			s := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", val)))
-			return s == "t" || s == "true" || s == "1" || s == "y" || s == "yes"
-		}
-	}
-
-	parseInt := func(val interface{}) int {
-		switch v := val.(type) {
-		case int:
-			return v
-		case int64:
-			return int(v)
-		case float64:
-			return int(v)
-		case string:
-			var n int
-			_, _ = fmt.Sscanf(strings.TrimSpace(v), "%d", &n)
-			return n
-		default:
-			var n int
-			_, _ = fmt.Sscanf(strings.TrimSpace(fmt.Sprintf("%v", val)), "%d", &n)
-			return n
-		}
-	}
-
-	var indexes []connection.IndexDefinition
-	for _, row := range data {
-		isUnique := false
-		if val, ok := row["is_unique"]; ok && val != nil {
-			isUnique = parseBool(val)
-		}
-
-		nonUnique := 1
-		if isUnique {
-			nonUnique = 0
-		}
-
-		seq := 0
-		if val, ok := row["seq_in_index"]; ok && val != nil {
-			seq = parseInt(val)
-		}
-
-		indexType := ""
-		if val, ok := row["index_type"]; ok && val != nil {
-			indexType = strings.ToUpper(fmt.Sprintf("%v", val))
-		}
-		if indexType == "" {
-			indexType = "BTREE"
-		}
-
-		idx := connection.IndexDefinition{
-			Name:       fmt.Sprintf("%v", row["index_name"]),
-			ColumnName: fmt.Sprintf("%v", row["column_name"]),
-			NonUnique:  nonUnique,
-			SeqInIndex: seq,
-			IndexType:  indexType,
-		}
-		indexes = append(indexes, idx)
-	}
-	return indexes, nil
+	return buildPGLikeIndexDefinitions(data), nil
 }
 
 func (v *VastbaseDB) GetForeignKeys(dbName, tableName string) ([]connection.ForeignKeyDefinition, error) {
@@ -406,7 +284,7 @@ func (v *VastbaseDB) GetForeignKeys(dbName, tableName string) ([]connection.Fore
 	}
 	table := strings.TrimSpace(tableName)
 	if table == "" {
-		return nil, fmt.Errorf("表名不能为空")
+		return nil, localizedDatabaseRuntimeError("db.backend.error.table_name_required", nil)
 	}
 
 	esc := func(s string) string { return strings.ReplaceAll(s, "'", "''") }
@@ -466,7 +344,7 @@ func (v *VastbaseDB) GetTriggers(dbName, tableName string) ([]connection.Trigger
 	}
 	table := strings.TrimSpace(tableName)
 	if table == "" {
-		return nil, fmt.Errorf("表名不能为空")
+		return nil, localizedDatabaseRuntimeError("db.backend.error.table_name_required", nil)
 	}
 
 	esc := func(s string) string { return strings.ReplaceAll(s, "'", "''") }
@@ -498,11 +376,19 @@ ORDER BY trigger_name, event_manipulation`, esc(table), esc(schema))
 
 func (v *VastbaseDB) GetAllColumns(dbName string) ([]connection.ColumnDefinitionWithTable, error) {
 	query := `
-SELECT table_schema, table_name, column_name, data_type
-FROM information_schema.columns
-WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
-  AND table_schema NOT LIKE 'pg_%'
-ORDER BY table_schema, table_name, ordinal_position`
+SELECT
+	c.table_schema,
+	c.table_name,
+	c.column_name,
+	c.data_type,
+	col_description(cls.oid, a.attnum) AS comment
+FROM information_schema.columns c
+LEFT JOIN pg_namespace n ON n.nspname = c.table_schema
+LEFT JOIN pg_class cls ON cls.relnamespace = n.oid AND cls.relname = c.table_name
+LEFT JOIN pg_attribute a ON a.attrelid = cls.oid AND a.attname = c.column_name
+WHERE c.table_schema NOT IN ('pg_catalog', 'information_schema')
+  AND c.table_schema NOT LIKE 'pg|_%' ESCAPE '|'
+ORDER BY c.table_schema, c.table_name, c.ordinal_position`
 
 	data, _, err := v.Query(query)
 	if err != nil {
@@ -522,6 +408,7 @@ ORDER BY table_schema, table_name, ordinal_position`
 			TableName: tableName,
 			Name:      fmt.Sprintf("%v", row["column_name"]),
 			Type:      fmt.Sprintf("%v", row["data_type"]),
+			Comment:   fmt.Sprintf("%v", row["comment"]),
 		}
 		cols = append(cols, col)
 	}
@@ -615,28 +502,18 @@ func (v *VastbaseDB) ApplyChanges(tableName string, changes connection.ChangeSet
 		}
 	}
 
-	// 3. Inserts
-	for _, row := range changes.Inserts {
-		var cols []string
-		var placeholders []string
-		var args []interface{}
-		idx := 0
-
-		for k, val := range row {
-			idx++
-			cols = append(cols, quoteIdent(k))
-			placeholders = append(placeholders, fmt.Sprintf("$%d", idx))
-			args = append(args, val)
-		}
-
-		if len(cols) == 0 {
-			continue
-		}
-
-		query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", qualifiedTable, strings.Join(cols, ", "), strings.Join(placeholders, ", "))
-		if _, err := tx.Exec(query, args...); err != nil {
-			return fmt.Errorf("插入失败：%v", err)
-		}
+	if err := execParameterizedInsertBatches(parameterizedInsertConfig{
+		Table:       qualifiedTable,
+		Rows:        changes.Inserts,
+		QuoteColumn: quoteIdent,
+		Placeholder: func(idx int) string {
+			return fmt.Sprintf("$%d", idx)
+		},
+		Exec: func(query string, args ...interface{}) (sql.Result, error) {
+			return tx.Exec(query, args...)
+		},
+	}); err != nil {
+		return err
 	}
 
 	return tx.Commit()

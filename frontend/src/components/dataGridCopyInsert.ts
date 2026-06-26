@@ -1,5 +1,6 @@
 import type { IndexDefinition } from '../types';
 import { escapeLiteral, quoteIdentPart, quoteQualifiedIdent } from '../utils/sql';
+import { isOracleLikeDialect } from '../utils/sqlDialect';
 
 type BuildCopyInsertSQLParams = {
   dbType: string;
@@ -17,13 +18,25 @@ type BuildCopyMutationSQLParams = BuildCopyInsertSQLParams & {
 
 type CopySqlWhereStrategy = 'primary-key' | 'unique-key' | 'all-columns';
 
+export type CopySqlErrorKey =
+  | 'data_grid.copy_sql.error.missing_safe_where'
+  | 'data_grid.copy_sql.error.missing_table_name'
+  | 'data_grid.copy_sql.error.no_copyable_fields';
+
+export type CopySqlStructuredError = {
+  key: CopySqlErrorKey;
+  params?: Record<string, string>;
+};
+
+export type CopySqlError = string | CopySqlStructuredError;
+
 export type CopyMutationSQLResult =
   | { ok: true; sql: string; whereStrategy: CopySqlWhereStrategy }
-  | { ok: false; error: string };
+  | { ok: false; error: CopySqlError };
 
 type CopyMutationWhereClauseResult =
   | { ok: true; clause: string; whereStrategy: CopySqlWhereStrategy }
-  | { ok: false; error: string };
+  | { ok: false; error: CopySqlError };
 
 const looksLikeDateTimeText = (val: string): boolean => {
   if (!val) return false;
@@ -50,9 +63,9 @@ const normalizeDateTimeString = (val: string): string => {
   }
 
   const match = val.match(
-    /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.\d+)?(?:\s*(?:Z|[+-]\d{2}:?\d{2})(?:\s+[A-Za-z_\/+-]+)?)?$/
+    /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(\.\d+)?(?:\s*(?:Z|[+-]\d{2}:?\d{2})(?:\s+[A-Za-z_\/+-]+)?)?$/
   );
-  return match ? `${match[1]} ${match[2]}` : val;
+  return match ? `${match[1]} ${match[2]}${match[3] || ''}` : val;
 };
 
 const normalizeTimezoneAwareDateTimeString = (val: string): string => {
@@ -65,13 +78,14 @@ const normalizeTimezoneAwareDateTimeString = (val: string): string => {
   }
 
   const match = val.match(
-    /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.\d+)?(?:\s*(Z|[+-]\d{2}:?\d{2})(?:\s+[A-Za-z_\/+-]+)?)?$/
+    /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(\.\d+)?(?:\s*(Z|[+-]\d{2}:?\d{2})(?:\s+[A-Za-z_\/+-]+)?)?$/
   );
   if (!match) {
     return val;
   }
-  const suffix = match[3] || '';
-  return `${match[1]} ${match[2]}${suffix}`;
+  const fractional = match[3] || '';
+  const suffix = match[4] || '';
+  return `${match[1]} ${match[2]}${fractional}${suffix}`;
 };
 
 const isTemporalColumnType = (columnType?: string): boolean => {
@@ -164,9 +178,49 @@ const toNormalizedLiteralText = (value: any, columnType?: string): string => {
   return String(value);
 };
 
-const formatCopySqlLiteral = (value: any, columnType?: string): string => {
+const hasFractionalSeconds = (value: string): boolean => /\d{2}:\d{2}:\d{2}\.\d+/.test(value);
+
+const stripFractionalSeconds = (value: string): string => (
+  value.replace(/(\d{2}:\d{2}:\d{2})\.\d+/, '$1')
+);
+
+const formatOracleTemporalLiteral = (value: any, columnType?: string): string | null => {
+  if (!isTemporalColumnType(columnType)) {
+    return null;
+  }
+  const normalized = toNormalizedLiteralText(value, columnType);
+  const rawType = String(columnType || '').toLowerCase();
+  const isTimestamp = rawType.includes('timestamp');
+  const oracleValue = isTimestamp ? normalized : stripFractionalSeconds(normalized);
+  const escaped = escapeLiteral(oracleValue);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(oracleValue)) {
+    return `TO_DATE('${escaped}', 'YYYY-MM-DD')`;
+  }
+  if (isTimezoneAwareColumnType(columnType) && /[+-]\d{2}:?\d{2}$/.test(oracleValue)) {
+    const compactOffset = oracleValue.replace(/([+-]\d{2}):(\d{2})$/, '$1:$2');
+    const temporalFormat = hasFractionalSeconds(oracleValue)
+      ? 'YYYY-MM-DD HH24:MI:SS.FFTZH:TZM'
+      : 'YYYY-MM-DD HH24:MI:SSTZH:TZM';
+    return `TO_TIMESTAMP_TZ('${escapeLiteral(compactOffset)}', '${temporalFormat}')`;
+  }
+  if (isTimestamp) {
+    const temporalFormat = hasFractionalSeconds(oracleValue)
+      ? 'YYYY-MM-DD HH24:MI:SS.FF'
+      : 'YYYY-MM-DD HH24:MI:SS';
+    return `TO_TIMESTAMP('${escaped}', '${temporalFormat}')`;
+  }
+  return `TO_DATE('${escaped}', 'YYYY-MM-DD HH24:MI:SS')`;
+};
+
+const formatCopySqlLiteral = (value: any, columnType?: string, dbType = ''): string => {
   if (value === null || value === undefined) {
     return 'NULL';
+  }
+  if (isOracleLikeDialect(dbType)) {
+    const oracleTemporalLiteral = formatOracleTemporalLiteral(value, columnType);
+    if (oracleTemporalLiteral) {
+      return oracleTemporalLiteral;
+    }
   }
   return `'${escapeLiteral(toNormalizedLiteralText(value, columnType))}'`;
 };
@@ -208,7 +262,7 @@ const buildWhereClauseForColumns = ({
       predicates.push(`${quotedColumn} IS NULL`);
       continue;
     }
-    predicates.push(`${quotedColumn} = ${formatCopySqlLiteral(value, getColumnType(columnTypesByLowerName, columnName))}`);
+    predicates.push(`${quotedColumn} = ${formatCopySqlLiteral(value, getColumnType(columnTypesByLowerName, columnName), dbType)}`);
   }
   if (predicates.length === 0) {
     return null;
@@ -268,7 +322,9 @@ const resolveMutationWhereClause = ({
 
   return {
     ok: false,
-    error: '当前结果集缺少可安全定位行数据的主键/唯一键，且未覆盖表的全部字段，无法生成 WHERE 条件。',
+    error: {
+      key: 'data_grid.copy_sql.error.missing_safe_where',
+    },
   };
 };
 
@@ -283,7 +339,7 @@ export const buildCopyInsertSQL = ({
   const quotedCols = orderedCols.map((col) => quoteIdentPart(dbType, col));
   const values = orderedCols.map((col) => {
     const { value } = getRecordValue(record, col);
-    return formatCopySqlLiteral(value, getColumnType(columnTypesByLowerName, col));
+    return formatCopySqlLiteral(value, getColumnType(columnTypesByLowerName, col), dbType);
   });
 
   return `INSERT INTO ${targetTable} (${quotedCols.join(', ')}) VALUES (${values.join(', ')});`;
@@ -307,13 +363,20 @@ const buildCopyMutationSQL = (
   if (!normalizedTableName) {
     return {
       ok: false,
-      error: `当前结果集未关联明确表名，无法生成 ${mode.toUpperCase()} SQL。`,
+      error: {
+        key: 'data_grid.copy_sql.error.missing_table_name',
+        params: {
+          mode: mode.toUpperCase(),
+        },
+      },
     };
   }
   if (normalizedOrderedCols.length === 0) {
     return {
       ok: false,
-      error: '当前结果集没有可复制的字段，无法生成 SQL。',
+      error: {
+        key: 'data_grid.copy_sql.error.no_copyable_fields',
+      },
     };
   }
 
@@ -341,7 +404,7 @@ const buildCopyMutationSQL = (
 
   const assignments = normalizedOrderedCols.map((columnName) => {
     const { value } = getRecordValue(record, columnName);
-    return `${quoteIdentPart(dbType, columnName)} = ${formatCopySqlLiteral(value, getColumnType(columnTypesByLowerName, columnName))}`;
+    return `${quoteIdentPart(dbType, columnName)} = ${formatCopySqlLiteral(value, getColumnType(columnTypesByLowerName, columnName), dbType)}`;
   });
 
   return {
@@ -365,13 +428,59 @@ export const resolveUniqueKeyGroupsFromIndexes = (indexes: IndexDefinition[] | u
     columns: Array<{ columnName: string; seqInIndex: number; order: number }>;
   };
 
+  const readIndexProp = (index: unknown, keys: string[]): unknown => {
+    const source = index as Record<string, unknown> | null | undefined;
+    if (!source || typeof source !== 'object') return undefined;
+    for (const key of keys) {
+      if (source[key] !== undefined && source[key] !== null) return source[key];
+    }
+    for (const [sourceKey, raw] of Object.entries(source)) {
+      if (keys.some((key) => sourceKey.toLowerCase() === key.toLowerCase())) {
+        return raw;
+      }
+    }
+    return undefined;
+  };
+
+  const readIndexText = (index: unknown, keys: string[]): string => {
+    const raw = readIndexProp(index, keys);
+    return raw === undefined || raw === null ? '' : String(raw).trim();
+  };
+
+  const readIndexBool = (index: unknown, keys: string[]): boolean | undefined => {
+    const raw = readIndexProp(index, keys);
+    if (raw === undefined || raw === null) return undefined;
+    if (typeof raw === 'boolean') return raw;
+    if (typeof raw === 'number') return raw !== 0;
+    const text = String(raw).trim().toLowerCase();
+    if (['1', 't', 'true', 'y', 'yes', 'unique'].includes(text)) return true;
+    if (['0', 'f', 'false', 'n', 'no', 'nonunique', 'non-unique'].includes(text)) return false;
+    return undefined;
+  };
+
+  const isUniqueIndex = (index: unknown): boolean => {
+    const nonUniqueRaw = readIndexProp(index, ['nonUnique', 'NonUnique', 'non_unique', 'NON_UNIQUE', 'Non_unique']);
+    if (nonUniqueRaw !== undefined && nonUniqueRaw !== null) {
+      if (typeof nonUniqueRaw === 'number') return nonUniqueRaw === 0;
+      const text = String(nonUniqueRaw).trim().toLowerCase();
+      if (['0', 'false', 'f', 'no', 'n'].includes(text)) return true;
+      if (['1', 'true', 't', 'yes', 'y'].includes(text)) return false;
+    }
+    const unique = readIndexBool(index, ['isUnique', 'is_unique', 'IS_UNIQUE', 'unique', 'UNIQUE']);
+    if (unique !== undefined) return unique;
+    const uniqueness = readIndexText(index, ['uniqueness', 'UNIQUENESS']);
+    if (uniqueness.toLowerCase() === 'unique') return true;
+    const indexType = readIndexText(index, ['indexType', 'IndexType', 'index_type', 'INDEX_TYPE']);
+    return indexType.toLowerCase() === 'unique';
+  };
+
   const buckets = new Map<string, IndexBucket>();
   (indexes || []).forEach((index, order) => {
-    if (index?.nonUnique !== 0) {
+    if (!isUniqueIndex(index)) {
       return;
     }
-    const name = String(index?.name || '').trim();
-    const columnName = String(index?.columnName || '').trim();
+    const name = readIndexText(index, ['name', 'Name', 'indexName', 'index_name', 'INDEX_NAME']);
+    const columnName = readIndexText(index, ['columnName', 'ColumnName', 'column_name', 'COLUMN_NAME']);
     if (!name || !columnName) {
       return;
     }
@@ -384,7 +493,9 @@ export const resolveUniqueKeyGroupsFromIndexes = (indexes: IndexDefinition[] | u
     }
     bucket.columns.push({
       columnName,
-      seqInIndex: Number.isFinite(Number(index?.seqInIndex)) ? Number(index.seqInIndex) : 0,
+      seqInIndex: Number.isFinite(Number(readIndexProp(index, ['seqInIndex', 'SeqInIndex', 'seq_in_index', 'SEQ_IN_INDEX', 'columnPosition', 'column_position'])))
+        ? Number(readIndexProp(index, ['seqInIndex', 'SeqInIndex', 'seq_in_index', 'SEQ_IN_INDEX', 'columnPosition', 'column_position']))
+        : 0,
       order,
     });
   });

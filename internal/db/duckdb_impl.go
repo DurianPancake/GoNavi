@@ -5,6 +5,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -18,9 +19,41 @@ type DuckDB struct {
 	pingTimeout time.Duration
 }
 
+func duckDBRuntimeError(key string, params map[string]any) error {
+	return errors.New(localizedDriverRuntimeText(key, params))
+}
+
+func duckDBWrapRuntimeError(prefixKey string, err error) error {
+	return fmt.Errorf("%s%w", localizedDriverRuntimeText(prefixKey, nil), err)
+}
+
+func duckDBConnectionNotOpenError() error {
+	return duckDBRuntimeError("db.backend.error.connection_not_open", nil)
+}
+
+func duckDBTableNameRequiredError() error {
+	return duckDBRuntimeError("db.backend.error.table_name_required", nil)
+}
+
+func duckDBCreateTableStatementNotFoundError() error {
+	return duckDBRuntimeError("db.backend.error.create_table_statement_not_found", nil)
+}
+
+func duckDBDeleteFailedError(err error) error {
+	return duckDBRuntimeError("db.backend.error.row_delete_failed", map[string]any{"detail": err.Error()})
+}
+
+func duckDBUpdateKeyConditionsRequiredError() error {
+	return duckDBRuntimeError("db.backend.error.row_update_key_conditions_required", nil)
+}
+
+func duckDBUpdateFailedError(err error) error {
+	return duckDBRuntimeError("db.backend.error.row_update_failed", map[string]any{"detail": err.Error()})
+}
+
 func (d *DuckDB) Connect(config connection.ConnectionConfig) error {
 	if supported, reason := duckDBBuildSupportStatus(); !supported {
-		return fmt.Errorf("DuckDB 驱动不可用：%s", reason)
+		return duckDBRuntimeError("db.backend.error.duckdb_driver_unavailable", map[string]any{"detail": reason})
 	}
 
 	dsn := strings.TrimSpace(config.Host)
@@ -33,7 +66,7 @@ func (d *DuckDB) Connect(config connection.ConnectionConfig) error {
 
 	db, err := sql.Open("duckdb", dsn)
 	if err != nil {
-		return fmt.Errorf("打开数据库连接失败：%w", err)
+		return duckDBWrapRuntimeError("db.backend.error.connection_open_failed_prefix", err)
 	}
 	d.conn = db
 	d.pingTimeout = getConnectTimeout(config)
@@ -41,7 +74,7 @@ func (d *DuckDB) Connect(config connection.ConnectionConfig) error {
 	if err := d.Ping(); err != nil {
 		_ = db.Close()
 		d.conn = nil
-		return fmt.Errorf("连接建立后验证失败：%w", err)
+		return duckDBWrapRuntimeError("db.backend.error.connection_verify_failed_prefix", err)
 	}
 	return nil
 }
@@ -55,7 +88,7 @@ func (d *DuckDB) Close() error {
 
 func (d *DuckDB) Ping() error {
 	if d.conn == nil {
-		return fmt.Errorf("连接未打开")
+		return duckDBConnectionNotOpenError()
 	}
 	timeout := d.pingTimeout
 	if timeout <= 0 {
@@ -68,7 +101,7 @@ func (d *DuckDB) Ping() error {
 
 func (d *DuckDB) QueryContext(ctx context.Context, query string) ([]map[string]interface{}, []string, error) {
 	if d.conn == nil {
-		return nil, nil, fmt.Errorf("连接未打开")
+		return nil, nil, duckDBConnectionNotOpenError()
 	}
 	rows, err := d.conn.QueryContext(ctx, query)
 	if err != nil {
@@ -80,7 +113,7 @@ func (d *DuckDB) QueryContext(ctx context.Context, query string) ([]map[string]i
 
 func (d *DuckDB) Query(query string) ([]map[string]interface{}, []string, error) {
 	if d.conn == nil {
-		return nil, nil, fmt.Errorf("连接未打开")
+		return nil, nil, duckDBConnectionNotOpenError()
 	}
 	rows, err := d.conn.Query(query)
 	if err != nil {
@@ -92,7 +125,7 @@ func (d *DuckDB) Query(query string) ([]map[string]interface{}, []string, error)
 
 func (d *DuckDB) ExecBatchContext(ctx context.Context, query string) (int64, error) {
 	if d.conn == nil {
-		return 0, fmt.Errorf("连接未打开")
+		return 0, duckDBConnectionNotOpenError()
 	}
 	res, err := d.conn.ExecContext(ctx, query)
 	if err != nil {
@@ -101,9 +134,20 @@ func (d *DuckDB) ExecBatchContext(ctx context.Context, query string) (int64, err
 	return res.RowsAffected()
 }
 
+func (d *DuckDB) OpenSessionExecer(ctx context.Context) (StatementExecer, error) {
+	if d.conn == nil {
+		return nil, duckDBConnectionNotOpenError()
+	}
+	conn, err := d.conn.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return NewSQLConnStatementExecer(conn), nil
+}
+
 func (d *DuckDB) ExecContext(ctx context.Context, query string) (int64, error) {
 	if d.conn == nil {
-		return 0, fmt.Errorf("连接未打开")
+		return 0, duckDBConnectionNotOpenError()
 	}
 	res, err := d.conn.ExecContext(ctx, query)
 	if err != nil {
@@ -114,7 +158,7 @@ func (d *DuckDB) ExecContext(ctx context.Context, query string) (int64, error) {
 
 func (d *DuckDB) Exec(query string) (int64, error) {
 	if d.conn == nil {
-		return 0, fmt.Errorf("连接未打开")
+		return 0, duckDBConnectionNotOpenError()
 	}
 	res, err := d.conn.Exec(query)
 	if err != nil {
@@ -149,12 +193,22 @@ func (d *DuckDB) GetDatabases() ([]string, error) {
 }
 
 func (d *DuckDB) GetTables(dbName string) ([]string, error) {
+	path := normalizeDuckDBObjectPath(dbName, "")
 	query := `
-SELECT table_schema, table_name
+SELECT table_catalog, table_schema, table_name
 FROM information_schema.tables
 WHERE table_type = 'BASE TABLE'
   AND table_schema NOT IN ('information_schema', 'pg_catalog')
-ORDER BY table_schema, table_name`
+ORDER BY table_catalog, table_schema, table_name`
+	if path.Catalog != "" {
+		query = fmt.Sprintf(`
+SELECT table_catalog, table_schema, table_name
+FROM information_schema.tables
+WHERE table_type = 'BASE TABLE'
+  AND table_schema NOT IN ('information_schema', 'pg_catalog')
+  AND table_catalog = '%s'
+ORDER BY table_catalog, table_schema, table_name`, escapeDuckDBLiteral(path.Catalog))
+	}
 
 	data, _, err := d.Query(query)
 	if err != nil {
@@ -164,14 +218,18 @@ ORDER BY table_schema, table_name`
 	seen := map[string]struct{}{}
 	var tables []string
 	for _, row := range data {
+		catalog := strings.TrimSpace(duckDBRowString(row, "table_catalog", "database_name"))
 		schema := strings.TrimSpace(duckDBRowString(row, "table_schema"))
 		name := strings.TrimSpace(duckDBRowString(row, "table_name"))
 		if name == "" {
 			continue
 		}
 		qualified := name
-		if schema != "" && !strings.EqualFold(schema, "main") {
+		if schema != "" {
 			qualified = schema + "." + name
+		}
+		if catalog != "" && !strings.EqualFold(catalog, "memory") && !strings.EqualFold(catalog, "main") {
+			qualified = catalog + "." + qualified
 		}
 		if _, exists := seen[qualified]; exists {
 			continue
@@ -183,18 +241,29 @@ ORDER BY table_schema, table_name`
 }
 
 func (d *DuckDB) GetCreateStatement(dbName, tableName string) (string, error) {
-	schema, pureTable := normalizeDuckDBSchemaAndTable(dbName, tableName)
-	if pureTable == "" {
-		return "", fmt.Errorf("表名不能为空")
+	path := normalizeDuckDBObjectPath(dbName, tableName)
+	if path.Object == "" {
+		return "", duckDBTableNameRequiredError()
 	}
 
-	escapedTable := escapeDuckDBLiteral(pureTable)
-	escapedSchema := escapeDuckDBLiteral(schema)
+	escapedTable := escapeDuckDBLiteral(path.Object)
+	escapedSchema := escapeDuckDBLiteral(path.Schema)
+	escapedCatalog := escapeDuckDBLiteral(path.Catalog)
 
-	queryCandidates := []string{
+	queryCandidates := make([]string, 0, 4)
+	if path.Catalog != "" {
+		queryCandidates = append(queryCandidates, fmt.Sprintf("SELECT sql FROM duckdb_tables() WHERE table_name = '%s' AND schema_name = '%s' AND database_name = '%s' LIMIT 1", escapedTable, escapedSchema, escapedCatalog))
+	}
+	queryCandidates = append(queryCandidates,
 		fmt.Sprintf("SELECT sql FROM duckdb_tables() WHERE table_name = '%s' AND schema_name = '%s' LIMIT 1", escapedTable, escapedSchema),
 		fmt.Sprintf("SELECT sql FROM duckdb_tables() WHERE table_name = '%s' LIMIT 1", escapedTable),
-		fmt.Sprintf("SHOW CREATE TABLE %s", quoteDuckDBQualifiedTable(schema, pureTable)),
+		fmt.Sprintf("SHOW CREATE TABLE %s", quoteDuckDBQualifiedTable(path.Schema, path.Object)),
+	)
+
+	if path.Catalog != "" {
+		queryCandidates = append([]string{
+			fmt.Sprintf("SHOW CREATE TABLE %s.%s", quoteDuckDBIdentifier(path.Catalog), quoteDuckDBQualifiedTable(path.Schema, path.Object)),
+		}, queryCandidates...)
 	}
 
 	for _, query := range queryCandidates {
@@ -215,65 +284,75 @@ func (d *DuckDB) GetCreateStatement(dbName, tableName string) (string, error) {
 		}
 	}
 
-	return "", fmt.Errorf("未找到建表语句")
+	return "", duckDBCreateTableStatementNotFoundError()
 }
 
 func (d *DuckDB) GetColumns(dbName, tableName string) ([]connection.ColumnDefinition, error) {
-	schema, pureTable := normalizeDuckDBSchemaAndTable(dbName, tableName)
-	if pureTable == "" {
-		return nil, fmt.Errorf("表名不能为空")
+	path := normalizeDuckDBObjectPath(dbName, tableName)
+	if path.Object == "" {
+		return nil, duckDBTableNameRequiredError()
 	}
 
 	query := fmt.Sprintf(`
 SELECT column_name, data_type, is_nullable, column_default
 FROM information_schema.columns
 WHERE table_name = '%s' AND table_schema = '%s'
-ORDER BY ordinal_position`, escapeDuckDBLiteral(pureTable), escapeDuckDBLiteral(schema))
+ORDER BY ordinal_position`, escapeDuckDBLiteral(path.Object), escapeDuckDBLiteral(path.Schema))
+	if path.Catalog != "" {
+		query = fmt.Sprintf(`
+SELECT column_name, data_type, is_nullable, column_default
+FROM information_schema.columns
+WHERE table_name = '%s' AND table_schema = '%s' AND table_catalog = '%s'
+ORDER BY ordinal_position`, escapeDuckDBLiteral(path.Object), escapeDuckDBLiteral(path.Schema), escapeDuckDBLiteral(path.Catalog))
+	}
 
 	data, _, err := d.Query(query)
 	if err != nil {
 		return nil, err
 	}
-	if len(data) == 0 && schema != "main" {
+	if len(data) == 0 && path.Schema != "main" {
 		fallbackQuery := fmt.Sprintf(`
 SELECT column_name, data_type, is_nullable, column_default
 FROM information_schema.columns
 WHERE table_name = '%s'
-ORDER BY ordinal_position`, escapeDuckDBLiteral(pureTable))
+ORDER BY ordinal_position`, escapeDuckDBLiteral(path.Object))
 		data, _, err = d.Query(fallbackQuery)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	var columns []connection.ColumnDefinition
-	for _, row := range data {
-		column := connection.ColumnDefinition{
-			Name:     duckDBRowString(row, "column_name"),
-			Type:     duckDBRowString(row, "data_type"),
-			Nullable: strings.ToUpper(strings.TrimSpace(duckDBRowString(row, "is_nullable"))),
-			Key:      "",
-			Extra:    "",
-			Comment:  "",
-		}
-		if column.Nullable == "" {
-			column.Nullable = "YES"
-		}
-		if defaultVal := strings.TrimSpace(duckDBRowString(row, "column_default")); defaultVal != "" && defaultVal != "<nil>" {
-			def := defaultVal
-			column.Default = &def
-		}
-		columns = append(columns, column)
+	constraintQuery := buildDuckDBConstraintMetadataQuery(path, true)
+	constraintRows, _, constraintErr := d.Query(constraintQuery)
+	if constraintErr != nil {
+		return nil, constraintErr
 	}
-	return columns, nil
+	if len(constraintRows) == 0 && path.Schema != "main" {
+		fallbackConstraintQuery := buildDuckDBConstraintMetadataQuery(path, false)
+		constraintRows, _, constraintErr = d.Query(fallbackConstraintQuery)
+		if constraintErr != nil {
+			return nil, constraintErr
+		}
+	}
+
+	return buildDuckDBColumnDefinitions(data, constraintRows), nil
 }
 
 func (d *DuckDB) GetAllColumns(dbName string) ([]connection.ColumnDefinitionWithTable, error) {
+	path := normalizeDuckDBObjectPath(dbName, "")
 	query := `
-SELECT table_schema, table_name, column_name, data_type
+SELECT table_catalog, table_schema, table_name, column_name, data_type
 FROM information_schema.columns
 WHERE table_schema NOT IN ('information_schema', 'pg_catalog')
-ORDER BY table_schema, table_name, ordinal_position`
+ORDER BY table_catalog, table_schema, table_name, ordinal_position`
+	if path.Catalog != "" {
+		query = fmt.Sprintf(`
+SELECT table_catalog, table_schema, table_name, column_name, data_type
+FROM information_schema.columns
+WHERE table_schema NOT IN ('information_schema', 'pg_catalog')
+  AND table_catalog = '%s'
+ORDER BY table_catalog, table_schema, table_name, ordinal_position`, escapeDuckDBLiteral(path.Catalog))
+	}
 
 	data, _, err := d.Query(query)
 	if err != nil {
@@ -282,13 +361,17 @@ ORDER BY table_schema, table_name, ordinal_position`
 
 	columns := make([]connection.ColumnDefinitionWithTable, 0, len(data))
 	for _, row := range data {
+		catalog := strings.TrimSpace(duckDBRowString(row, "table_catalog", "database_name"))
 		schema := strings.TrimSpace(duckDBRowString(row, "table_schema"))
 		tableName := strings.TrimSpace(duckDBRowString(row, "table_name"))
 		if tableName == "" {
 			continue
 		}
-		if schema != "" && !strings.EqualFold(schema, "main") {
+		if schema != "" {
 			tableName = schema + "." + tableName
+		}
+		if catalog != "" && !strings.EqualFold(catalog, "memory") && !strings.EqualFold(catalog, "main") {
+			tableName = catalog + "." + tableName
 		}
 
 		columns = append(columns, connection.ColumnDefinitionWithTable{
@@ -301,7 +384,38 @@ ORDER BY table_schema, table_name, ordinal_position`
 }
 
 func (d *DuckDB) GetIndexes(dbName, tableName string) ([]connection.IndexDefinition, error) {
-	return []connection.IndexDefinition{}, nil
+	path := normalizeDuckDBObjectPath(dbName, tableName)
+	if path.Object == "" {
+		return nil, duckDBTableNameRequiredError()
+	}
+
+	constraintQuery := buildDuckDBConstraintMetadataQuery(path, true)
+	constraintRows, _, err := d.Query(constraintQuery)
+	if err != nil {
+		return nil, err
+	}
+	if len(constraintRows) == 0 && path.Schema != "main" {
+		fallbackQuery := buildDuckDBConstraintMetadataQuery(path, false)
+		constraintRows, _, err = d.Query(fallbackQuery)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	indexQuery := buildDuckDBIndexMetadataQuery(path, true)
+	indexRows, _, indexErr := d.Query(indexQuery)
+	if indexErr != nil {
+		return nil, indexErr
+	}
+	if len(indexRows) == 0 && path.Schema != "main" {
+		fallbackIndexQuery := buildDuckDBIndexMetadataQuery(path, false)
+		indexRows, _, indexErr = d.Query(fallbackIndexQuery)
+		if indexErr != nil {
+			return nil, indexErr
+		}
+	}
+
+	return buildDuckDBIndexDefinitions(constraintRows, indexRows), nil
 }
 
 func (d *DuckDB) GetForeignKeys(dbName, tableName string) ([]connection.ForeignKeyDefinition, error) {
@@ -314,7 +428,7 @@ func (d *DuckDB) GetTriggers(dbName, tableName string) ([]connection.TriggerDefi
 
 func (d *DuckDB) ApplyChanges(tableName string, changes connection.ChangeSet) error {
 	if d.conn == nil {
-		return fmt.Errorf("连接未打开")
+		return duckDBConnectionNotOpenError()
 	}
 
 	tx, err := d.conn.Begin()
@@ -333,31 +447,39 @@ func (d *DuckDB) ApplyChanges(tableName string, changes connection.ChangeSet) er
 		return `"` + n + `"`
 	}
 
-	schema := ""
-	table := strings.TrimSpace(tableName)
-	if parts := strings.SplitN(table, ".", 2); len(parts) == 2 {
-		schema = strings.TrimSpace(parts[0])
-		table = strings.TrimSpace(parts[1])
-	}
+	path := normalizeDuckDBObjectPath("", tableName)
+	schema := path.Schema
+	table := path.Object
 
 	qualifiedTable := quoteIdent(table)
 	if schema != "" {
 		qualifiedTable = fmt.Sprintf("%s.%s", quoteIdent(schema), quoteIdent(table))
 	}
 
-	for _, pk := range changes.Deletes {
+	isDuckDBRowIDLocator := strings.EqualFold(strings.TrimSpace(changes.LocatorStrategy), "duckdb-rowid")
+	buildWhere := func(keys map[string]interface{}) ([]string, []interface{}) {
 		var wheres []string
 		var args []interface{}
-		for k, v := range pk {
+		for k, v := range keys {
+			if isDuckDBRowIDLocator && strings.EqualFold(strings.TrimSpace(k), "rowid") {
+				wheres = append(wheres, "rowid = ?")
+				args = append(args, v)
+				continue
+			}
 			wheres = append(wheres, fmt.Sprintf("%s = ?", quoteIdent(k)))
 			args = append(args, v)
 		}
+		return wheres, args
+	}
+
+	for _, pk := range changes.Deletes {
+		wheres, args := buildWhere(pk)
 		if len(wheres) == 0 {
 			continue
 		}
 		query := fmt.Sprintf("DELETE FROM %s WHERE %s", qualifiedTable, strings.Join(wheres, " AND "))
 		if _, err := tx.Exec(query, args...); err != nil {
-			return fmt.Errorf("删除失败：%v", err)
+			return duckDBDeleteFailedError(err)
 		}
 	}
 
@@ -372,106 +494,30 @@ func (d *DuckDB) ApplyChanges(tableName string, changes connection.ChangeSet) er
 			continue
 		}
 
-		var wheres []string
-		for k, v := range update.Keys {
-			wheres = append(wheres, fmt.Sprintf("%s = ?", quoteIdent(k)))
-			args = append(args, v)
-		}
+		wheres, whereArgs := buildWhere(update.Keys)
+		args = append(args, whereArgs...)
 		if len(wheres) == 0 {
-			return fmt.Errorf("更新操作需要主键条件")
+			return duckDBUpdateKeyConditionsRequiredError()
 		}
 
 		query := fmt.Sprintf("UPDATE %s SET %s WHERE %s", qualifiedTable, strings.Join(sets, ", "), strings.Join(wheres, " AND "))
 		if _, err := tx.Exec(query, args...); err != nil {
-			return fmt.Errorf("更新失败：%v", err)
+			return duckDBUpdateFailedError(err)
 		}
 	}
 
-	for _, row := range changes.Inserts {
-		var cols []string
-		var placeholders []string
-		var args []interface{}
-
-		for k, v := range row {
-			cols = append(cols, quoteIdent(k))
-			placeholders = append(placeholders, "?")
-			args = append(args, v)
-		}
-		if len(cols) == 0 {
-			continue
-		}
-
-		query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", qualifiedTable, strings.Join(cols, ", "), strings.Join(placeholders, ", "))
-		if _, err := tx.Exec(query, args...); err != nil {
-			return fmt.Errorf("插入失败：%v", err)
-		}
+	if err := execParameterizedInsertBatches(parameterizedInsertConfig{
+		Table:       qualifiedTable,
+		Rows:        changes.Inserts,
+		QuoteColumn: quoteIdent,
+		Placeholder: func(int) string { return "?" },
+		Exec: func(query string, args ...interface{}) (sql.Result, error) {
+			return tx.Exec(query, args...)
+		},
+		MaxArgs: sqliteBatchInsertArgs,
+	}); err != nil {
+		return err
 	}
 
 	return tx.Commit()
-}
-
-func normalizeDuckDBSchemaAndTable(dbName string, tableName string) (string, string) {
-	schema := strings.TrimSpace(dbName)
-	table := strings.TrimSpace(tableName)
-	if table == "" {
-		if schema == "" {
-			schema = "main"
-		}
-		return schema, table
-	}
-
-	if parts := strings.SplitN(table, ".", 2); len(parts) == 2 {
-		left := strings.TrimSpace(parts[0])
-		right := strings.TrimSpace(parts[1])
-		if left != "" && right != "" {
-			return normalizeDuckDBIdentifier(left), normalizeDuckDBIdentifier(right)
-		}
-	}
-
-	if schema == "" {
-		schema = "main"
-	}
-	return normalizeDuckDBIdentifier(schema), normalizeDuckDBIdentifier(table)
-}
-
-func normalizeDuckDBIdentifier(raw string) string {
-	text := strings.TrimSpace(raw)
-	if len(text) >= 2 {
-		first := text[0]
-		last := text[len(text)-1]
-		if (first == '"' && last == '"') || (first == '`' && last == '`') {
-			text = strings.TrimSpace(text[1 : len(text)-1])
-		}
-	}
-	return text
-}
-
-func quoteDuckDBIdentifier(raw string) string {
-	text := normalizeDuckDBIdentifier(raw)
-	return `"` + strings.ReplaceAll(text, `"`, `""`) + `"`
-}
-
-func quoteDuckDBQualifiedTable(schema string, table string) string {
-	s := strings.TrimSpace(schema)
-	t := strings.TrimSpace(table)
-	if s == "" {
-		return quoteDuckDBIdentifier(t)
-	}
-	return quoteDuckDBIdentifier(s) + "." + quoteDuckDBIdentifier(t)
-}
-
-func duckDBRowString(row map[string]interface{}, keys ...string) string {
-	for _, key := range keys {
-		for rowKey, value := range row {
-			if !strings.EqualFold(rowKey, key) || value == nil {
-				continue
-			}
-			return fmt.Sprintf("%v", value)
-		}
-	}
-	return ""
-}
-
-func escapeDuckDBLiteral(raw string) string {
-	return strings.ReplaceAll(raw, "'", "''")
 }

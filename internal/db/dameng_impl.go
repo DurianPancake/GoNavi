@@ -31,27 +31,28 @@ func (d *DamengDB) getDSN(config connection.ConnectionConfig) string {
 	// or dm://user:password@host:port
 
 	address := net.JoinHostPort(config.Host, strconv.Itoa(config.Port))
-	escapedPassword := url.PathEscape(config.Password)
 	q := url.Values{}
 	if config.Database != "" {
 		q.Set("schema", config.Database)
 	}
 	if config.UseSSL {
 		if certPath := strings.TrimSpace(config.SSLCertPath); certPath != "" {
-			q.Set("SSL_CERT_PATH", certPath)
+			q.Set("sslCertPath", certPath)
 		}
 		if keyPath := strings.TrimSpace(config.SSLKeyPath); keyPath != "" {
-			q.Set("SSL_KEY_PATH", keyPath)
+			q.Set("sslKeyPath", keyPath)
 		}
 	}
-	if escapedPassword != config.Password {
-		// 达梦驱动要求：密码包含特殊字符时，password 需 PathEscape，并添加 escapeProcess=true 让驱动解码。
-		q.Set("escapeProcess", "true")
-	}
+	mergeConnectionParamsFromConfigWithAllowlist(q, config, damengConnectionParamNames, "dm", "dameng")
 
-	dsn := fmt.Sprintf("dm://%s:%s@%s", config.User, escapedPassword, address)
+	// 当前达梦 Go 驱动使用字符串切分解析 DSN，认证信息不会做 URL 反解码。
+	// 密码保持原样传入，避免 p%40ss 这类转义文本被当作真实密码登录。
+	dsn := fmt.Sprintf("dm://%s:%s@%s", config.User, config.Password, address)
 	encoded := q.Encode()
 	if encoded == "" {
+		if strings.Contains(config.User, "?") || strings.Contains(config.Password, "?") {
+			return dsn + "?"
+		}
 		return dsn
 	}
 	return dsn + "?" + encoded
@@ -109,6 +110,7 @@ func (d *DamengDB) Connect(config connection.ConnectionConfig) error {
 			failures = append(failures, fmt.Sprintf("第%d次连接打开失败: %v", idx+1, err))
 			continue
 		}
+		configureSQLConnectionPool(db, "dameng")
 		d.conn = db
 		d.pingTimeout = getConnectTimeout(attempt)
 		if err := d.Ping(); err != nil {
@@ -181,6 +183,24 @@ func (d *DamengDB) Query(query string) ([]map[string]interface{}, []string, erro
 	return scanRows(rows)
 }
 
+func (d *DamengDB) StreamQueryContext(ctx context.Context, query string, consumer QueryStreamConsumer) error {
+	if d.conn == nil {
+		return fmt.Errorf("连接未打开")
+	}
+
+	rows, err := d.conn.QueryContext(ctx, query)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	return streamRows(rows, consumer)
+}
+
+func (d *DamengDB) StreamQuery(query string, consumer QueryStreamConsumer) error {
+	return d.StreamQueryContext(context.Background(), query, consumer)
+}
+
 func (d *DamengDB) ExecContext(ctx context.Context, query string) (int64, error) {
 	if d.conn == nil {
 		return 0, fmt.Errorf("连接未打开")
@@ -210,9 +230,13 @@ func (d *DamengDB) GetDatabases() ([]string, error) {
 }
 
 func (d *DamengDB) GetTables(dbName string) ([]string, error) {
-	query := fmt.Sprintf("SELECT owner, table_name FROM all_tables WHERE owner = '%s' ORDER BY table_name", strings.ToUpper(dbName))
-	if dbName == "" {
-		query = "SELECT table_name FROM user_tables"
+	// 始终返回 OWNER.TABLE_NAME，与 Oracle 实现对齐，避免下游 SQL 缺少 schema 前缀（refs issue #445）
+	// 列别名用双引号包裹强制大写，避免不同驱动版本返回不一致 case 导致 row map 取值失败
+	var query string
+	if dbName != "" {
+		query = fmt.Sprintf(`SELECT owner AS "OWNER", table_name AS "TABLE_NAME" FROM all_tables WHERE owner = '%s' ORDER BY table_name`, strings.ToUpper(dbName))
+	} else {
+		query = `SELECT USER AS "OWNER", table_name AS "TABLE_NAME" FROM user_tables ORDER BY table_name`
 	}
 
 	data, _, err := d.Query(query)
@@ -222,16 +246,14 @@ func (d *DamengDB) GetTables(dbName string) ([]string, error) {
 
 	var tables []string
 	for _, row := range data {
-		if dbName != "" {
-			if owner, okOwner := row["OWNER"]; okOwner {
-				if name, okName := row["TABLE_NAME"]; okName {
-					tables = append(tables, fmt.Sprintf("%v.%v", owner, name))
-					continue
-				}
-			}
+		owner, okOwner := row["OWNER"]
+		name, okName := row["TABLE_NAME"]
+		if okOwner && okName && name != nil {
+			tables = append(tables, fmt.Sprintf("%v.%v", owner, name))
+			continue
 		}
-		if val, ok := row["TABLE_NAME"]; ok {
-			tables = append(tables, fmt.Sprintf("%v", val))
+		if okName && name != nil {
+			tables = append(tables, fmt.Sprintf("%v", name))
 		}
 	}
 	return tables, nil
@@ -260,42 +282,16 @@ func (d *DamengDB) GetCreateStatement(dbName, tableName string) (string, error) 
 			return fmt.Sprintf("%v", val), nil
 		}
 	}
-	return "", fmt.Errorf("未找到建表语句")
+	return "", localizedDatabaseRuntimeError("db.backend.error.create_table_statement_not_found", nil)
 }
 
 func (d *DamengDB) GetColumns(dbName, tableName string) ([]connection.ColumnDefinition, error) {
-	query := fmt.Sprintf(`SELECT column_name, data_type, nullable, data_default 
-		FROM all_tab_columns 
-		WHERE owner = '%s' AND table_name = '%s'`,
-		strings.ToUpper(dbName), strings.ToUpper(tableName))
-
-	if dbName == "" {
-		query = fmt.Sprintf(`SELECT column_name, data_type, nullable, data_default 
-			FROM user_tab_columns 
-			WHERE table_name = '%s'`, strings.ToUpper(tableName))
-	}
-
-	data, _, err := d.Query(query)
+	data, _, err := d.Query(buildDamengColumnsQuery(dbName, tableName))
 	if err != nil {
 		return nil, err
 	}
 
-	var columns []connection.ColumnDefinition
-	for _, row := range data {
-		col := connection.ColumnDefinition{
-			Name:     fmt.Sprintf("%v", row["COLUMN_NAME"]),
-			Type:     fmt.Sprintf("%v", row["DATA_TYPE"]),
-			Nullable: fmt.Sprintf("%v", row["NULLABLE"]),
-		}
-
-		if row["DATA_DEFAULT"] != nil {
-			def := fmt.Sprintf("%v", row["DATA_DEFAULT"])
-			col.Default = &def
-		}
-
-		columns = append(columns, col)
-	}
-	return columns, nil
+	return buildDamengColumnDefinitions(data), nil
 }
 
 func (d *DamengDB) GetIndexes(dbName, tableName string) ([]connection.IndexDefinition, error) {
@@ -503,9 +499,11 @@ func (d *DamengDB) ApplyChanges(tableName string, changes connection.ChangeSet) 
 }
 
 func (d *DamengDB) GetAllColumns(dbName string) ([]connection.ColumnDefinitionWithTable, error) {
-	query := fmt.Sprintf(`SELECT table_name, column_name, data_type 
-		FROM all_tab_columns 
-		WHERE owner = '%s'`, strings.ToUpper(dbName))
+	query := fmt.Sprintf(`SELECT c.table_name, c.column_name, c.data_type, cc.comments AS comment
+		FROM all_tab_columns c
+		LEFT JOIN all_col_comments cc
+		  ON cc.owner = c.owner AND cc.table_name = c.table_name AND cc.column_name = c.column_name
+		WHERE c.owner = '%s'`, strings.ReplaceAll(strings.ToUpper(dbName), "'", "''"))
 
 	data, _, err := d.Query(query)
 	if err != nil {
@@ -518,6 +516,7 @@ func (d *DamengDB) GetAllColumns(dbName string) ([]connection.ColumnDefinitionWi
 			TableName: fmt.Sprintf("%v", row["TABLE_NAME"]),
 			Name:      fmt.Sprintf("%v", row["COLUMN_NAME"]),
 			Type:      fmt.Sprintf("%v", row["DATA_TYPE"]),
+			Comment:   fmt.Sprintf("%v", row["COMMENT"]),
 		}
 		cols = append(cols, col)
 	}

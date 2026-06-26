@@ -1,0 +1,80 @@
+import { describe, expect, it } from 'vitest';
+
+import { extractQueryResultTableRef } from './queryResultTable';
+
+describe('extractQueryResultTableRef', () => {
+  it('preserves Oracle schema-qualified table names for editing', () => {
+    expect(extractQueryResultTableRef('SELECT * FROM MYCIMLED.EDC_LOG FETCH FIRST 500 ROWS ONLY', 'oracle', 'ANONYMOUS'))
+      .toEqual({
+        tableName: 'MYCIMLED.EDC_LOG',
+        metadataDbName: 'MYCIMLED',
+        metadataTableName: 'EDC_LOG',
+      });
+  });
+
+  it('normalizes unquoted Oracle identifiers to their folded uppercase names', () => {
+    expect(extractQueryResultTableRef('select * from mycimled.edc_log fetch first 500 rows only', 'oracle', 'anonymous'))
+      .toEqual({
+        tableName: 'MYCIMLED.EDC_LOG',
+        metadataDbName: 'MYCIMLED',
+        metadataTableName: 'EDC_LOG',
+      });
+  });
+
+  it('preserves quoted Oracle identifier case', () => {
+    expect(extractQueryResultTableRef('SELECT * FROM "mycimled"."edc_log"', 'oracle', 'ANONYMOUS'))
+      .toEqual({
+        tableName: 'mycimled.edc_log',
+        metadataDbName: 'mycimled',
+        metadataTableName: 'edc_log',
+      });
+  });
+
+  it('uses current schema for unqualified Oracle tables', () => {
+    expect(extractQueryResultTableRef('SELECT * FROM EDC_LOG', 'oracle', 'MYCIMLED'))
+      .toEqual({
+        tableName: 'EDC_LOG',
+        metadataDbName: 'MYCIMLED',
+        metadataTableName: 'EDC_LOG',
+      });
+  });
+
+  it('uses the login user as Oracle default schema when the current db is a service name', () => {
+    expect(extractQueryResultTableRef('SELECT * FROM per_cert_info', 'oracle', 'ORCLPDB1', 'dev'))
+      .toEqual({
+        tableName: 'PER_CERT_INFO',
+        metadataDbName: 'DEV',
+        metadataTableName: 'PER_CERT_INFO',
+      });
+  });
+
+  it('keeps existing simple table behavior for MySQL-style qualified names', () => {
+    expect(extractQueryResultTableRef('SELECT * FROM app.users LIMIT 500', 'mysql', 'app'))
+      .toEqual({
+        tableName: 'users',
+        metadataDbName: 'app',
+        metadataTableName: 'users',
+      });
+  });
+
+  it('keeps DuckDB schema-qualified table names for metadata lookups', () => {
+    expect(extractQueryResultTableRef('SELECT * FROM main.events LIMIT 500', 'duckdb', 'main'))
+      .toEqual({
+        tableName: 'main.events',
+        metadataDbName: 'main',
+        metadataTableName: 'main.events',
+      });
+  });
+
+  it('does not mark join results as editable table refs', () => {
+    expect(extractQueryResultTableRef('SELECT * FROM users u JOIN orders o ON u.id = o.user_id', 'oracle', 'APP'))
+      .toBeUndefined();
+  });
+
+  it('does not mark grouped or distinct results as editable table refs', () => {
+    expect(extractQueryResultTableRef('SELECT ID FROM users GROUP BY ID', 'mysql', 'app'))
+      .toBeUndefined();
+    expect(extractQueryResultTableRef('SELECT DISTINCT ID FROM users', 'mysql', 'app'))
+      .toBeUndefined();
+  });
+});

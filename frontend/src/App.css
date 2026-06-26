@@ -1,3 +1,8 @@
+:root {
+  --gn-font-sans: "Inter", "PingFang SC", "Noto Sans CJK SC", "Noto Sans SC", "Source Han Sans SC", "WenQuanYi Micro Hei", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, "Helvetica Neue", "Segoe UI", "Ubuntu", sans-serif;
+  --gn-font-mono: "JetBrains Mono", "Noto Sans Mono CJK SC", "Noto Sans Mono", ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+}
+
 html, body, #root {
   height: 100%;
   margin: 0;
@@ -7,7 +12,22 @@ html, body, #root {
 }
 
 body, #root {
-  border-radius: 14px; /* Slightly rounded app window corners */
+  border-radius: var(--gonavi-border-radius); /* Slightly rounded app window corners */
+}
+
+body,
+button,
+input,
+textarea,
+select {
+  font-family: var(--gn-font-sans);
+}
+
+code,
+pre,
+kbd,
+samp {
+  font-family: var(--gn-font-mono);
 }
 
 /* 侧边栏 Tree 样式优化 */
@@ -35,6 +55,60 @@ body, #root {
   text-overflow: ellipsis;
   white-space: nowrap;
   padding-right: 8px;
+}
+
+.sidebar-tree-scroll-shell {
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.sidebar-tree-scroll-content {
+  min-width: 100%;
+}
+
+.sidebar-tree-scroll-shell .ant-tree {
+  min-width: 100%;
+}
+
+.sidebar-tree-scroll-shell .ant-tree .ant-tree-list-holder,
+.sidebar-tree-scroll-shell .ant-tree .ant-tree-list-holder-inner {
+  min-width: 100%;
+}
+
+.sidebar-tree-scroll-shell .ant-tree .ant-tree-treenode {
+  width: auto;
+  min-width: 100%;
+}
+
+.sidebar-tree-scroll-shell .ant-tree .ant-tree-node-content-wrapper {
+  width: auto !important;
+  min-width: 0;
+  display: flex !important;
+  align-items: center;
+  gap: 8px;
+}
+
+.sidebar-tree-scroll-shell .ant-tree .ant-tree-switcher {
+  flex: 0 0 24px;
+  width: 24px;
+  min-width: 24px;
+}
+
+.sidebar-tree-scroll-shell .ant-tree .ant-tree-iconEle {
+  flex: 0 0 16px;
+  width: 16px;
+  min-width: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-inline-end: 0;
+}
+
+.sidebar-tree-scroll-shell .ant-tree .ant-tree-title {
+  flex: 0 0 auto;
+  min-width: 0;
+  overflow: visible;
+  text-overflow: clip;
 }
 
 .redis-viewer-workbench .ant-tree {
@@ -291,35 +365,217 @@ body[data-theme='light'] .redis-viewer-workbench .ant-radio-button-wrapper-check
     color: #fff !important;
 }
 
-/* 驱动管理：统一关闭 antd sticky 横向条，仅保留自定义独立横向条 */
-.driver-manager-table .ant-table-sticky-scroll {
-    display: none !important;
+.driver-manager-modal .ant-modal-body {
+    background: var(--ant-color-bg-layout, #f5f5f5);
 }
 
-/* 仅在独立横向条激活时隐藏表格自身横向滚动条，避免出现双横向条 */
-.driver-manager-table-wrap.driver-manager-table-wrap-external-active .driver-manager-table .ant-table-content,
-.driver-manager-table-wrap.driver-manager-table-wrap-external-active .driver-manager-table .ant-table-body {
-    overflow-x: auto !important;
-    -ms-overflow-style: none;
-    scrollbar-width: none;
-}
-
-.driver-manager-table-wrap.driver-manager-table-wrap-external-active .driver-manager-table .ant-table-content::-webkit-scrollbar:horizontal,
-.driver-manager-table-wrap.driver-manager-table-wrap-external-active .driver-manager-table .ant-table-body::-webkit-scrollbar:horizontal {
-    height: 0 !important;
-}
-
-.driver-manager-table-wrap {
-    width: 100%;
-    max-width: 100%;
-    overflow-x: hidden;
-}
-
-.driver-manager-footer {
-    width: 100%;
+.driver-manager-shell {
     display: flex;
     flex-direction: column;
+    gap: 14px;
+}
+
+.driver-manager-header {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 16px;
+    align-items: stretch;
+    padding: 14px 16px;
+    border: 1px solid rgba(5, 5, 5, 0.08);
+    border-radius: 8px;
+    background: var(--ant-color-bg-container, #fff);
+}
+
+.driver-manager-heading {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+}
+
+.driver-manager-stats {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(64px, 1fr));
     gap: 8px;
+    min-width: 360px;
+}
+
+.driver-manager-stat {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    justify-content: center;
+    min-height: 58px;
+    padding: 8px 10px;
+    border: 1px solid rgba(5, 5, 5, 0.08);
+    border-radius: 8px;
+    background: rgba(5, 5, 5, 0.02);
+}
+
+.driver-manager-stat span:first-child {
+    font-size: 20px;
+    font-weight: 700;
+    line-height: 1.2;
+}
+
+.driver-manager-stat-warning span:first-child {
+    color: #d48806;
+}
+
+.driver-manager-directory-panel {
+    border: 1px solid rgba(5, 5, 5, 0.08);
+    border-radius: 8px;
+    background: var(--ant-color-bg-container, #fff);
+}
+
+.driver-manager-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.driver-manager-search {
+    min-width: 280px;
+    flex: 1 1 360px;
+}
+
+.driver-manager-toolbar-actions {
+    justify-content: flex-end;
+}
+
+.driver-manager-batch-progress-panel {
+    display: grid;
+    gap: 8px;
+    padding: 12px 14px;
+    border-radius: 8px;
+}
+
+.driver-manager-batch-progress-header,
+.driver-manager-batch-progress-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 12px;
+    align-items: center;
+    justify-content: space-between;
+    min-width: 0;
+}
+
+.driver-manager-batch-progress-header span,
+.driver-manager-batch-progress-meta span {
+    min-width: 0;
+    word-break: break-word;
+}
+
+.driver-manager-list-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    min-height: 24px;
+}
+
+.driver-manager-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.driver-manager-card {
+    border: 1px solid rgba(5, 5, 5, 0.08);
+    border-radius: 8px;
+    background: var(--ant-color-bg-container, #fff);
+    overflow: hidden;
+}
+
+.driver-manager-card-warning {
+    border-color: rgba(250, 173, 20, 0.35);
+}
+
+.driver-manager-card-ready {
+    border-color: rgba(82, 196, 26, 0.22);
+}
+
+.driver-manager-card-main {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(300px, 38%);
+    gap: 16px;
+    padding: 16px;
+}
+
+.driver-manager-card-info {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-width: 0;
+}
+
+.driver-manager-title-row,
+.driver-manager-meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    min-width: 0;
+}
+
+.driver-manager-driver-name {
+    font-size: 16px;
+}
+
+.driver-manager-meta-row {
+    row-gap: 4px;
+}
+
+.driver-manager-update-note {
+    display: grid;
+    gap: 4px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: rgba(250, 173, 20, 0.1);
+}
+
+.driver-manager-note-text,
+.driver-manager-muted-message {
+    margin-bottom: 0 !important;
+}
+
+.driver-manager-muted-message {
+    color: var(--ant-color-text-secondary);
+}
+
+.driver-manager-card-controls {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-width: 0;
+}
+
+.driver-manager-control-block {
+    display: grid;
+    gap: 4px;
+}
+
+.driver-manager-control-label,
+.driver-manager-small-text {
+    font-size: 12px;
+}
+
+.driver-manager-version-control {
+    display: grid;
+    gap: 4px;
+}
+
+.driver-manager-version-lock {
+    line-height: 24px;
+}
+
+.driver-manager-card-actions {
+    justify-content: flex-end;
+}
+
+.driver-manager-card-actions .ant-btn {
+    min-width: 88px;
 }
 
 .driver-manager-footer-actions {
@@ -328,15 +584,110 @@ body[data-theme='light'] .redis-viewer-workbench .ant-radio-button-wrapper-check
     justify-content: flex-end;
 }
 
-.driver-manager-hscroll {
-    width: 100%;
-    height: 12px;
-    overflow-x: auto;
-    overflow-y: hidden;
-    scrollbar-gutter: stable;
-    background: transparent;
+@media (max-width: 900px) {
+    .driver-manager-header,
+    .driver-manager-card-main {
+        grid-template-columns: 1fr;
+    }
+
+    .driver-manager-stats {
+        min-width: 0;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .driver-manager-card-actions {
+        justify-content: flex-start;
+    }
+
+    .driver-manager-batch-progress-header,
+    .driver-manager-batch-progress-meta {
+        justify-content: flex-start;
+    }
 }
 
-.driver-manager-hscroll-inner {
-    height: 1px;
+.security-update-action-btn.ant-btn,
+.security-update-action-btn.ant-btn-default,
+.security-update-action-btn.ant-btn-primary,
+.security-update-action-btn.ant-btn-text {
+    box-shadow: none !important;
+}
+
+.security-update-action-btn.ant-btn:focus,
+.security-update-action-btn.ant-btn:focus-visible,
+.security-update-action-btn.ant-btn-default:focus,
+.security-update-action-btn.ant-btn-default:focus-visible,
+.security-update-action-btn.ant-btn-primary:focus,
+.security-update-action-btn.ant-btn-primary:focus-visible,
+.security-update-action-btn.ant-btn-text:focus,
+.security-update-action-btn.ant-btn-text:focus-visible {
+    outline: none !important;
+    box-shadow: none !important;
+}
+
+.security-update-banner {
+    position: relative;
+    isolation: isolate;
+}
+
+.security-update-result-card {
+    transition: background 0.22s ease, box-shadow 0.22s ease, transform 0.22s ease;
+}
+
+.security-update-result-card-active {
+    animation: security-update-result-pulse 1.8s ease;
+}
+
+@keyframes security-update-result-pulse {
+    0% {
+        transform: translateY(0);
+    }
+    30% {
+        transform: translateY(-2px);
+    }
+    100% {
+        transform: translateY(0);
+    }
+}
+.gonavi-query-editor-link-hint {
+  color: #1677ff !important;
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-style: solid;
+  text-decoration-color: currentColor;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+.gonavi-query-editor-object-token {
+  color: #2563eb;
+}
+
+.gonavi-query-editor-column-token {
+  color: #0f766e;
+}
+
+.gonavi-query-editor-db-token {
+  color: #7c3aed;
+}
+
+body[data-theme='dark'] .gonavi-query-editor-object-token {
+  color: #7dd3fc;
+}
+
+body[data-theme='dark'] .gonavi-query-editor-link-hint {
+  color: #69b1ff !important;
+}
+
+body[data-theme='dark'] .gonavi-query-editor-column-token {
+  color: #5eead4;
+}
+
+body[data-theme='dark'] .gonavi-query-editor-db-token {
+  color: #c4b5fd;
+}
+
+/* Legacy sidebar resize bounds — mirror v2 .gn-v2-app-sider so Ant Design inline width locks do not collapse drag range. */
+body[data-ui-version="legacy"] .ant-layout-sider {
+  min-width: 232px !important;
+  max-width: 420px !important;
 }

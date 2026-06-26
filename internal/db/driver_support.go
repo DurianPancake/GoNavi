@@ -1,38 +1,61 @@
 package db
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"GoNavi-Wails/internal/appdata"
 )
 
 // coreBuiltinDrivers 是始终内置可用的核心驱动，无需额外安装即可使用。
 var coreBuiltinDrivers = map[string]struct{}{
 	"mysql":    {},
+	"goldendb": {},
 	"redis":    {},
 	"oracle":   {},
 	"postgres": {},
+	"chroma":   {},
+	"qdrant":   {},
+	"rocketmq": {},
+	"mqtt":     {},
+	"kafka":    {},
+	"rabbitmq": {},
 }
 
 // optionalGoDrivers 表示需要用户“安装启用”后才能使用的纯 Go 驱动。
 // 注意：这是一种运行时门控（installed.json 标记），并不减少主二进制体积。
 var optionalGoDrivers = map[string]struct{}{
-	"mariadb":    {},
-	"diros":      {},
-	"sphinx":     {},
-	"sqlserver":  {},
-	"sqlite":     {},
-	"duckdb":     {},
-	"dameng":     {},
-	"kingbase":   {},
-	"highgo":     {},
-	"vastbase":   {},
-	"mongodb":    {},
-	"tdengine":   {},
-	"clickhouse": {},
+	"mariadb":       {},
+	"oceanbase":     {},
+	"diros":         {},
+	"starrocks":     {},
+	"sphinx":        {},
+	"sqlserver":     {},
+	"sqlite":        {},
+	"duckdb":        {},
+	"dameng":        {},
+	"kingbase":      {},
+	"highgo":        {},
+	"vastbase":      {},
+	"opengauss":     {},
+	"gaussdb":       {},
+	"iris":          {},
+	"mongodb":       {},
+	"tdengine":      {},
+	"iotdb":         {},
+	"clickhouse":    {},
+	"elasticsearch": {},
+	"trino":         {},
 }
+
+// optionalDriverAgentRevisions 记录 GoNavi 对各可选 driver-agent 包装逻辑的兼容版本。
+// 该 map 由 tools/generate-driver-agent-revisions.sh 按 driver-agent 源码依赖自动生成，
+// 避免人工判断需要 bump 哪个驱动 revision。
+var optionalDriverAgentRevisions = map[string]string{}
 
 var (
 	externalDriverDirMu sync.RWMutex
@@ -46,6 +69,32 @@ func normalizeRuntimeDriverType(driverType string) string {
 		return "diros"
 	case "postgresql":
 		return "postgres"
+	case "kingbase8", "kingbasees", "kingbasev8":
+		return "kingbase"
+	case "opengauss", "open_gauss", "open-gauss":
+		return "opengauss"
+	case "gaussdb", "gauss_db", "gauss-db":
+		return "gaussdb"
+	case "goldendb", "greatdb", "gdb":
+		return "goldendb"
+	case "intersystems", "intersystemsiris", "inter-systems-iris", "inter-systems":
+		return "iris"
+	case "elastic":
+		return "elasticsearch"
+	case "chromadb", "chroma-db":
+		return "chroma"
+	case "qdrantdb", "qdrant-db":
+		return "qdrant"
+	case "rocketmq", "rocket-mq", "rocket_mq", "apache-rocketmq", "apache_rocketmq", "rmq":
+		return "rocketmq"
+	case "mqtt", "mqtts":
+		return "mqtt"
+	case "apache-iotdb", "apache_iotdb", "iotdb":
+		return "iotdb"
+	case "kafka", "apache-kafka", "apache_kafka":
+		return "kafka"
+	case "rabbitmq", "rabbit-mq", "rabbit_mq":
+		return "rabbitmq"
 	default:
 		return normalized
 	}
@@ -55,14 +104,20 @@ func driverDisplayName(driverType string) string {
 	switch normalizeRuntimeDriverType(driverType) {
 	case "mysql":
 		return "MySQL"
+	case "goldendb":
+		return "GoldenDB"
 	case "oracle":
 		return "Oracle"
 	case "redis":
 		return "Redis"
 	case "mariadb":
 		return "MariaDB"
+	case "oceanbase":
+		return "OceanBase"
 	case "diros":
 		return "Doris"
+	case "starrocks":
+		return "StarRocks"
 	case "sphinx":
 		return "Sphinx"
 	case "postgres":
@@ -81,12 +136,36 @@ func driverDisplayName(driverType string) string {
 		return "HighGo"
 	case "vastbase":
 		return "Vastbase"
+	case "opengauss":
+		return "OpenGauss"
+	case "gaussdb":
+		return "GaussDB"
+	case "iris":
+		return "InterSystems IRIS"
 	case "mongodb":
 		return "MongoDB"
 	case "tdengine":
 		return "TDengine"
+	case "iotdb":
+		return "Apache IoTDB"
 	case "clickhouse":
 		return "ClickHouse"
+	case "elasticsearch":
+		return "Elasticsearch"
+	case "trino":
+		return "Trino"
+	case "chroma":
+		return "Chroma"
+	case "qdrant":
+		return "Qdrant"
+	case "rocketmq":
+		return "RocketMQ"
+	case "mqtt":
+		return "MQTT"
+	case "kafka":
+		return "Kafka"
+	case "rabbitmq":
+		return "RabbitMQ"
 	default:
 		return strings.ToUpper(strings.TrimSpace(driverType))
 	}
@@ -103,6 +182,10 @@ func IsOptionalGoDriverBuildIncluded(driverType string) bool {
 	return optionalGoDriverBuildIncluded(normalizeRuntimeDriverType(driverType))
 }
 
+func OptionalDriverAgentRevision(driverType string) string {
+	return strings.TrimSpace(optionalDriverAgentRevisions[normalizeRuntimeDriverType(driverType)])
+}
+
 // IsBuiltinDriver 返回指定驱动类型是否为核心内置驱动（始终可用，无需安装）。
 func IsBuiltinDriver(driverType string) bool {
 	_, ok := coreBuiltinDrivers[normalizeRuntimeDriverType(driverType)]
@@ -110,13 +193,7 @@ func IsBuiltinDriver(driverType string) bool {
 }
 
 func defaultExternalDriverDownloadDirectory() string {
-	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
-		return filepath.Join(home, ".gonavi", "drivers")
-	}
-	if wd, err := os.Getwd(); err == nil && strings.TrimSpace(wd) != "" {
-		return filepath.Join(wd, ".gonavi-drivers")
-	}
-	return ".gonavi-drivers"
+	return appdata.DriverRoot("")
 }
 
 func resolveExternalDriverRoot(downloadDir string) (string, error) {
@@ -135,7 +212,9 @@ func resolveExternalDriverRoot(downloadDir string) (string, error) {
 		root = abs
 	}
 	if err := os.MkdirAll(root, 0o755); err != nil {
-		return "", fmt.Errorf("创建驱动目录失败：%w", err)
+		return "", fmt.Errorf("%s%w", localizedDriverRuntimeText("driver_manager.backend.error.create_directory_failed", map[string]any{
+			"detail": "",
+		}), err)
 	}
 	return root, nil
 }
@@ -192,16 +271,28 @@ func optionalGoDriverRuntimeReady(driverType string) (bool, string) {
 	if !IsOptionalGoDriver(normalized) {
 		return true, ""
 	}
+	displayName := driverDisplayName(normalized)
 	executablePath, err := ResolveOptionalDriverAgentExecutablePath("", normalized)
 	if err != nil {
-		return false, fmt.Sprintf("%s 驱动代理路径解析失败，请在驱动管理中重新安装启用", driverDisplayName(normalized))
+		return false, localizedDriverRuntimeText("driver_manager.backend.status.agent_path_failed", map[string]any{"name": displayName})
 	}
 	info, statErr := os.Stat(executablePath)
 	if statErr != nil || info.IsDir() {
-		return false, fmt.Sprintf("%s 驱动代理缺失，请在驱动管理中重新安装启用", driverDisplayName(normalized))
+		return false, localizedDriverRuntimeText("driver_manager.backend.status.agent_missing", map[string]any{"name": displayName})
 	}
 	if validateErr := ValidateOptionalDriverAgentExecutable(normalized, executablePath); validateErr != nil {
-		return false, fmt.Sprintf("%s；请在驱动管理中重新安装启用", validateErr.Error())
+		var archErr *driverAgentArchMismatchError
+		if errors.As(validateErr, &archErr) {
+			return false, localizedDriverRuntimeText("driver_manager.backend.status.agent_arch_incompatible_detail", map[string]any{
+				"name":    displayName,
+				"file":    archErr.fileLabel,
+				"process": archErr.processLabel,
+			})
+		}
+		return false, localizedDriverRuntimeText("driver_manager.backend.status.agent_unavailable_reinstall", map[string]any{
+			"name":   displayName,
+			"detail": validateErr.Error(),
+		})
 	}
 	return true, ""
 }
@@ -210,7 +301,7 @@ func optionalGoDriverRuntimeReady(driverType string) (bool, string) {
 func DriverRuntimeSupportStatus(driverType string) (bool, string) {
 	normalized := normalizeRuntimeDriverType(driverType)
 	if normalized == "" {
-		return false, "未识别的数据源类型"
+		return false, localizedDriverRuntimeText("driver_manager.backend.status.unrecognized_driver_type", nil)
 	}
 	if normalized == "custom" {
 		return true, ""
@@ -219,8 +310,9 @@ func DriverRuntimeSupportStatus(driverType string) (bool, string) {
 		return true, ""
 	}
 	if IsOptionalGoDriver(normalized) {
+		displayName := driverDisplayName(normalized)
 		if !IsOptionalGoDriverBuildIncluded(normalized) {
-			return false, fmt.Sprintf("%s 当前发行包为精简构建，未内置该驱动；如需使用请安装 Full 版", driverDisplayName(normalized))
+			return false, localizedDriverRuntimeText("driver_manager.backend.status.slim_build_required", map[string]any{"name": displayName})
 		}
 		if optionalGoDriverInstalled(normalized) {
 			if ready, reason := optionalGoDriverRuntimeReady(normalized); !ready {
@@ -228,7 +320,7 @@ func DriverRuntimeSupportStatus(driverType string) (bool, string) {
 			}
 			return true, ""
 		}
-		return false, fmt.Sprintf("%s 纯 Go 驱动未启用，请先在驱动管理中点击“安装启用”", driverDisplayName(normalized))
+		return false, localizedDriverRuntimeText("driver_manager.backend.status.optional_disabled", map[string]any{"name": displayName})
 	}
 	return true, ""
 }

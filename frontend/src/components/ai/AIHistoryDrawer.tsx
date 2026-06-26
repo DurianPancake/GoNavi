@@ -1,7 +1,9 @@
 import React, { useState } from 'react';
 import { Drawer, Button, Tooltip, Input } from 'antd';
 import { MenuFoldOutlined, PlusOutlined, DeleteOutlined, SearchOutlined } from '@ant-design/icons';
+import { t as catalogTranslate } from '../../i18n/catalog';
 import { useStore } from '../../store';
+import { useOptionalI18n } from '../../i18n/provider';
 
 interface AIHistoryDrawerProps {
     open: boolean;
@@ -18,16 +20,36 @@ interface AIHistoryDrawerProps {
 export const AIHistoryDrawer: React.FC<AIHistoryDrawerProps> = ({
     open, onClose, bgColor, darkMode, textColor, mutedColor, borderColor, onCreateNew, sessionId
 }) => {
+    const i18n = useOptionalI18n();
+    const t = i18n?.t ?? ((key: string) => catalogTranslate('en-US', key));
     const aiChatSessions = useStore(state => state.aiChatSessions);
     const setAIActiveSessionId = useStore(state => state.setAIActiveSessionId);
     const deleteAISession = useStore(state => state.deleteAISession);
-    
-    // 阶段4: 历史记录搜索
-    const [searchText, setSearchText] = useState('');
 
-    const filteredSessions = aiChatSessions.filter(s => 
-        !searchText || (s.title && s.title.toLowerCase().includes(searchText.toLowerCase()))
+    const [searchText, setSearchText] = useState('');
+    const normalizedSearchText = searchText.trim().toLowerCase();
+    const defaultSessionTitle = t('ai_chat.history.default_session_title');
+
+    React.useEffect(() => {
+        if (!open && searchText) {
+            setSearchText('');
+        }
+    }, [open, searchText]);
+
+    const sortedSessions = React.useMemo(
+        () => [...aiChatSessions].sort((left, right) => right.updatedAt - left.updatedAt),
+        [aiChatSessions],
     );
+
+    const filteredSessions = React.useMemo(
+        () => sortedSessions.filter((session) =>
+            !normalizedSearchText || (session.title && session.title.toLowerCase().includes(normalizedSearchText))),
+        [normalizedSearchText, sortedSessions],
+    );
+
+    const emptyStateText = normalizedSearchText
+        ? t('ai_chat.history.empty.no_matches')
+        : t('ai_chat.history.empty.no_history');
 
     return (
         <Drawer
@@ -36,36 +58,43 @@ export const AIHistoryDrawer: React.FC<AIHistoryDrawerProps> = ({
             onClose={onClose}
             open={open}
             getContainer={false}
-            style={{ position: 'absolute', background: bgColor || (darkMode ? '#1e1e1e' : '#f8f9fa') }}
+            rootStyle={{ position: 'absolute' }}
             width={260}
-            bodyStyle={{ padding: 0, display: 'flex', flexDirection: 'column' }}
+            styles={{
+                content: {
+                    background: bgColor || (darkMode ? '#1e1e1e' : '#f8f9fa'),
+                },
+                body: {
+                    padding: 0,
+                    display: 'flex',
+                    flexDirection: 'column',
+                },
+            }}
         >
-            {/* 侧拉面板头部 */}
             <div style={{ padding: '16px 16px 12px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <span style={{ fontSize: 14, fontWeight: 600, color: textColor }}>对话历史</span>
-                <Tooltip title="收起">
+                <span style={{ fontSize: 14, fontWeight: 600, color: textColor }}>{t('ai_chat.history.title')}</span>
+                <Tooltip title={t('ai_chat.history.tooltip.collapse')}>
                     <Button type="text" size="small" icon={<MenuFoldOutlined />} onClick={onClose} style={{ color: mutedColor }} />
                 </Tooltip>
             </div>
 
-            {/* 新建对话按钮 */}
             <div style={{ padding: '0 12px 12px' }}>
-                <Button 
-                    type="dashed" 
-                    block 
-                    icon={<PlusOutlined />} 
+                <Button
+                    type="dashed"
+                    block
+                    icon={<PlusOutlined />}
                     onClick={() => { onCreateNew(); onClose(); }}
                     style={{ borderColor: borderColor, color: textColor, background: 'transparent' }}
                 >
-                    开启新对话
+                    {t('ai_chat.history.action.new_chat')}
                 </Button>
             </div>
 
-            {/* 列表搜索 */}
             <div style={{ padding: '0 12px 12px' }}>
-                <Input 
-                    placeholder="搜索历史记录..." 
+                <Input
+                    placeholder={t('ai_chat.history.search.placeholder')}
                     prefix={<SearchOutlined style={{ color: mutedColor }} />}
+                    allowClear
                     value={searchText}
                     onChange={e => setSearchText(e.target.value)}
                     variant="filled"
@@ -74,13 +103,12 @@ export const AIHistoryDrawer: React.FC<AIHistoryDrawerProps> = ({
                 />
             </div>
 
-            {/* 列表容器 */}
             <div style={{ flex: 1, overflowY: 'auto', padding: '0 10px 16px' }} className="ai-history-list">
                 {filteredSessions.length === 0 ? (
-                    <div style={{ padding: '30px 0', textAlign: 'center', color: mutedColor, fontSize: 12 }}>暂无匹配的对话记录</div>
+                    <div style={{ padding: '30px 0', textAlign: 'center', color: mutedColor, fontSize: 12 }}>{emptyStateText}</div>
                 ) : (
                     filteredSessions.map(session => (
-                        <div 
+                        <div
                             key={session.id}
                             className={`ai-history-item ${sessionId === session.id ? 'active' : ''}`}
                             onClick={() => { setAIActiveSessionId(session.id); onClose(); }}
@@ -98,19 +126,19 @@ export const AIHistoryDrawer: React.FC<AIHistoryDrawerProps> = ({
                         >
                             <div style={{ overflow: 'hidden', flex: 1, paddingRight: 8 }}>
                                 <div style={{ fontSize: 13, color: textColor, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', fontWeight: sessionId === session.id ? 600 : 'normal' }}>
-                                    {session.title || '新对话'}
+                                    {session.title || defaultSessionTitle}
                                 </div>
                                 <div style={{ fontSize: 11, color: mutedColor, marginTop: 4 }}>
                                     {new Date(session.updatedAt).toLocaleString(undefined, { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
                                 </div>
                             </div>
-                            <Tooltip title="删除">
-                                <Button 
+                            <Tooltip title={t('ai_chat.history.tooltip.delete')}>
+                                <Button
                                     className="ai-history-delete-btn"
-                                    type="text" 
-                                    size="small" 
-                                    danger 
-                                    icon={<DeleteOutlined />} 
+                                    type="text"
+                                    size="small"
+                                    danger
+                                    icon={<DeleteOutlined />}
                                     onClick={(e) => {
                                         e.stopPropagation();
                                         deleteAISession(session.id);

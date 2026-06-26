@@ -67,7 +67,7 @@ func NewAnthropicProvider(config ai.ProviderConfig) (Provider, error) {
 	}
 	model := strings.TrimSpace(config.Model)
 	if model == "" {
-		return nil, fmt.Errorf("模型 ID 不能为空，请在设置中选择或输入模型")
+		return nil, fmt.Errorf("model ID is required; select or enter a model in Settings")
 	}
 	maxTokens := config.MaxTokens
 	if maxTokens <= 0 {
@@ -100,7 +100,7 @@ func (p *AnthropicProvider) Name() string {
 
 func (p *AnthropicProvider) Validate() error {
 	if strings.TrimSpace(p.config.APIKey) == "" {
-		return fmt.Errorf("API Key 不能为空")
+		return fmt.Errorf("API key is required")
 	}
 	return nil
 }
@@ -108,13 +108,13 @@ func (p *AnthropicProvider) Validate() error {
 // --- 请求体类型 ---
 
 type anthropicRequest struct {
-	Model       string              `json:"model"`
-	Messages    []anthropicMessage  `json:"messages"`
-	System      string              `json:"system,omitempty"`
-	MaxTokens   int                 `json:"max_tokens"`
-	Temperature float64             `json:"temperature,omitempty"`
-	Stream      bool                `json:"stream,omitempty"`
-	Tools       []anthropicTool     `json:"tools,omitempty"`
+	Model       string             `json:"model"`
+	Messages    []anthropicMessage `json:"messages"`
+	System      string             `json:"system,omitempty"`
+	MaxTokens   int                `json:"max_tokens"`
+	Temperature float64            `json:"temperature,omitempty"`
+	Stream      bool               `json:"stream,omitempty"`
+	Tools       []anthropicTool    `json:"tools,omitempty"`
 }
 
 // anthropicTool Anthropic 格式的工具定义
@@ -206,7 +206,7 @@ func buildAnthropicMessages(reqMessages []ai.Message) []anthropicMessage {
 			}
 			text := m.Content
 			if text == "" {
-				text = "请描述和分析这张图片。"
+				text = providerImageFallbackPrompt("")
 			}
 			contentParts = append(contentParts, map[string]interface{}{
 				"type": "text",
@@ -261,6 +261,7 @@ func (p *AnthropicProvider) Chat(ctx context.Context, req ai.ChatRequest) (*ai.C
 	}
 
 	systemMsg, messages := extractSystemMessage(req.Messages)
+	messages = applyImageFallbackPrompt(messages, req.ImageFallbackPrompt)
 	anthropicMsgs := buildAnthropicMessages(messages)
 
 	temperature := req.Temperature
@@ -283,19 +284,27 @@ func (p *AnthropicProvider) Chat(ctx context.Context, req ai.ChatRequest) (*ai.C
 
 	respBody, err := p.doRequest(ctx, body)
 	if err != nil {
-		return nil, err
+		if len(req.Tools) > 0 && isHTTP400Error(err) {
+			body.Tools = nil
+			respBody, err = p.doRequest(ctx, body)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, err
+		}
 	}
 	defer respBody.Close()
 
 	var result anthropicResponse
 	if err := json.NewDecoder(respBody).Decode(&result); err != nil {
-		return nil, fmt.Errorf("解析 Anthropic 响应失败: %w", err)
+		return nil, fmt.Errorf("parse Anthropic response failed: %w", err)
 	}
 	if result.Error != nil && result.Error.Message != "" {
-		return nil, fmt.Errorf("Anthropic API 错误: %s", result.Error.Message)
+		return nil, fmt.Errorf("Anthropic API error: %s", result.Error.Message)
 	}
 	if len(result.Content) == 0 {
-		return nil, fmt.Errorf("Anthropic 返回空响应")
+		return nil, fmt.Errorf("Anthropic returned empty response")
 	}
 
 	// 解析响应中的 text 和 tool_use content blocks
@@ -313,10 +322,7 @@ func (p *AnthropicProvider) Chat(ctx context.Context, req ai.ChatRequest) (*ai.C
 			toolCalls = append(toolCalls, ai.ToolCall{
 				ID:   block.ID,
 				Type: "function",
-				Function: struct {
-					Name      string `json:"name"`
-					Arguments string `json:"arguments"`
-				}{
+				Function: ai.ToolCallFunction{
 					Name:      block.Name,
 					Arguments: argsStr,
 				},
@@ -343,6 +349,7 @@ func (p *AnthropicProvider) ChatStream(ctx context.Context, req ai.ChatRequest, 
 	}
 
 	systemMsg, messages := extractSystemMessage(req.Messages)
+	messages = applyImageFallbackPrompt(messages, req.ImageFallbackPrompt)
 	anthropicMsgs := buildAnthropicMessages(messages)
 
 	temperature := req.Temperature
@@ -366,15 +373,23 @@ func (p *AnthropicProvider) ChatStream(ctx context.Context, req ai.ChatRequest, 
 
 	respBody, err := p.doRequest(ctx, body)
 	if err != nil {
-		return err
+		if len(req.Tools) > 0 && isHTTP400Error(err) {
+			body.Tools = nil
+			respBody, err = p.doRequest(ctx, body)
+			if err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
 	}
 	defer respBody.Close()
 
 	// 跟踪当前活跃的 tool_use blocks
 	type activeToolUse struct {
-		id        string
-		name      string
-		argsJSON  strings.Builder
+		id       string
+		name     string
+		argsJSON strings.Builder
 	}
 	activeBlocks := make(map[int]*activeToolUse) // index -> block
 
@@ -427,10 +442,7 @@ func (p *AnthropicProvider) ChatStream(ctx context.Context, req ai.ChatRequest, 
 						{
 							ID:   block.id,
 							Type: "function",
-							Function: struct {
-								Name      string `json:"name"`
-								Arguments string `json:"arguments"`
-							}{
+							Function: ai.ToolCallFunction{
 								Name:      block.name,
 								Arguments: argsStr,
 							},
@@ -455,14 +467,16 @@ func (p *AnthropicProvider) ChatStream(ctx context.Context, req ai.ChatRequest, 
 func (p *AnthropicProvider) doRequest(ctx context.Context, body interface{}) (io.ReadCloser, error) {
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
-		return nil, fmt.Errorf("序列化请求失败: %w", err)
+		return nil, fmt.Errorf("serialize request failed: %w", err)
 	}
 
 	url := normalizeAnthropicMessagesURL(p.baseURL)
+	requestLog := logAIUpstreamRequestStart(p.Name(), http.MethodPost, url, body)
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(jsonBody))
 	if err != nil {
-		return nil, fmt.Errorf("创建 HTTP 请求失败: %w", err)
+		logAIUpstreamRequestFinish(requestLog, 0, err)
+		return nil, fmt.Errorf("create HTTP request failed: %w", err)
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -487,15 +501,19 @@ func (p *AnthropicProvider) doRequest(ctx context.Context, body interface{}) (io
 
 	resp, err := p.client.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("发送请求到 %s 失败: %w", url, err)
+		logAIUpstreamRequestFinish(requestLog, 0, err)
+		return nil, fmt.Errorf("request to %s failed: %w", url, err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("Anthropic API 返回错误 (HTTP %d): %s", resp.StatusCode, string(bodyBytes))
+		statusErr := fmt.Errorf("Anthropic API returned error (HTTP %d): %s", resp.StatusCode, string(bodyBytes))
+		logAIUpstreamRequestFinish(requestLog, resp.StatusCode, statusErr)
+		return nil, statusErr
 	}
 
+	logAIUpstreamRequestFinish(requestLog, resp.StatusCode, nil)
 	return resp.Body, nil
 }
 

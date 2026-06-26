@@ -1,0 +1,681 @@
+import React from 'react';
+import { Button, Dropdown, Tabs, Tooltip, message, type MenuProps } from 'antd';
+import { BugOutlined, CloseOutlined, CopyOutlined, EyeInvisibleOutlined, RobotOutlined } from '@ant-design/icons';
+
+import type { EditRowLocator } from '../utils/rowLocator';
+import type { QueryResultPaginationState } from '../utils/queryResultPagination';
+import { t as defaultTranslate } from '../i18n';
+import { useOptionalI18n } from '../i18n/provider';
+import DataGrid from './DataGrid';
+import LogPanel from './LogPanel';
+
+export const QUERY_EDITOR_SQL_LOG_TAB_KEY = '__gonavi_sql_execution_log__';
+
+export type QueryEditorResultSet = {
+    key: string;
+    sql: string;
+    exportSql?: string;
+    sourceStatementIndex?: number;
+    statementResultIndex?: number;
+    rows: any[];
+    columns: string[];
+    messages?: string[];
+    resultType?: 'grid' | 'message';
+    tableName?: string;
+    pkColumns: string[];
+    editLocator?: EditRowLocator;
+    readOnly: boolean;
+    showRowNumberColumn?: boolean;
+    truncated?: boolean;
+    pkLoading?: boolean;
+    page?: QueryResultPaginationState & { loading?: boolean };
+};
+
+interface QueryEditorResultsPanelProps {
+    resultSets: QueryEditorResultSet[];
+    activeResultKey: string;
+    loading: boolean;
+    executionError: string;
+    sqlLogCount: number;
+    darkMode: boolean;
+    isV2Ui: boolean;
+    currentDb: string;
+    currentConnectionId: string;
+    toggleShortcutLabel: string;
+    onActiveResultKeyChange: (key: string) => void;
+    onHide: () => void;
+    onCloseResult: (key: string) => void;
+    onCloseOtherResultTabs: (key: string) => void;
+    onCloseResultTabsToLeft: (key: string) => void;
+    onCloseResultTabsToRight: (key: string) => void;
+    onCloseAllResultTabs: () => void;
+    onReloadResult: (key: string, sql: string) => void;
+    onResultPageChange: (key: string, page: number, pageSize: number) => void;
+    onDiagnoseExecutionError: () => void;
+}
+
+const isAffectedRowsResult = (result: QueryEditorResultSet): boolean =>
+    result.columns.length === 1 && result.columns[0] === 'affectedRows';
+
+const QueryEditorResultsPanel: React.FC<QueryEditorResultsPanelProps> = ({
+    resultSets,
+    activeResultKey,
+    loading,
+    executionError,
+    sqlLogCount,
+    darkMode,
+    isV2Ui,
+    currentDb,
+    currentConnectionId,
+    toggleShortcutLabel,
+    onActiveResultKeyChange,
+    onHide,
+    onCloseResult,
+    onCloseOtherResultTabs,
+    onCloseResultTabsToLeft,
+    onCloseResultTabsToRight,
+    onCloseAllResultTabs,
+    onReloadResult,
+    onResultPageChange,
+    onDiagnoseExecutionError,
+}) => {
+    const i18n = useOptionalI18n();
+    const t = i18n?.t ?? defaultTranslate;
+    const shouldShowSqlLogTab = isV2Ui && (sqlLogCount > 0 || activeResultKey === QUERY_EDITOR_SQL_LOG_TAB_KEY);
+    const logTabCountLabel = sqlLogCount > 999 ? '999+' : String(sqlLogCount);
+    const resolvedResultSetKey = activeResultKey && resultSets.some((rs) => rs.key === activeResultKey)
+        ? activeResultKey
+        : (resultSets[0]?.key || '');
+    const hideTooltipTitle = toggleShortcutLabel
+        ? t('query_editor.results_panel.tooltip.hide_with_shortcut', { shortcut: toggleShortcutLabel })
+        : t('query_editor.results_panel.tooltip.hide');
+    const handleMessageTextareaKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+        if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey || event.key.toLowerCase() !== 'a') {
+            return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        event.currentTarget.focus();
+        event.currentTarget.select();
+    };
+    const handleCopyMessageText = async (text: string) => {
+        const safeText = String(text || '');
+        if (!safeText.trim()) {
+            return;
+        }
+        try {
+            if (typeof navigator?.clipboard?.writeText !== 'function') {
+                throw new Error(t('query_editor.results_panel.message.copy_unsupported'));
+            }
+            await navigator.clipboard.writeText(safeText);
+            message.success(t('data_grid.message.copied_to_clipboard'));
+        } catch (error: any) {
+            message.error(t('query_editor.results_panel.message.copy_failed', {
+                detail: error?.message || t('common.unknown'),
+            }));
+        }
+    };
+    const renderMessageBlock = ({
+        text,
+        title,
+        fontSize,
+        fillHeight = false,
+        compact = false,
+        maxWidth,
+        color,
+        marginTop,
+    }: {
+        text: string;
+        title?: string;
+        fontSize: string;
+        fillHeight?: boolean;
+        compact?: boolean;
+        maxWidth?: number;
+        color: string;
+        marginTop?: number;
+    }) => (
+        <div style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: compact ? 8 : 12,
+            padding: compact ? 12 : 16,
+            borderRadius: 8,
+            border: darkMode ? '1px solid rgba(255,255,255,0.12)' : '1px solid rgba(0,0,0,0.08)',
+            background: darkMode ? 'rgba(255,255,255,0.03)' : '#fff',
+            textAlign: 'left',
+            marginTop,
+            width: maxWidth ? `min(100%, ${maxWidth}px)` : '100%',
+            flex: fillHeight ? 1 : undefined,
+            minHeight: fillHeight ? 0 : undefined,
+            boxSizing: 'border-box',
+        }}>
+            <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: title ? 'space-between' : 'flex-end',
+                gap: 12,
+            }}>
+                {title ? <span style={{ fontSize: 14, fontWeight: 600 }}>{title}</span> : <span />}
+                <Button
+                    size="small"
+                    icon={<CopyOutlined />}
+                    onClick={() => { void handleCopyMessageText(text); }}
+                    disabled={!text.trim()}
+                >
+                    {t('query_editor.results_panel.message.action.copy')}
+                </Button>
+            </div>
+            <textarea
+                readOnly
+                wrap="soft"
+                spellCheck={false}
+                aria-label={title || t('query_editor.results_panel.message.title')}
+                data-query-result-message-textarea={compact ? 'compact' : 'full'}
+                value={text}
+                onKeyDown={handleMessageTextareaKeyDown}
+                style={{
+                    width: '100%',
+                    flex: fillHeight ? 1 : undefined,
+                    minHeight: compact ? 72 : 0,
+                    maxHeight: compact ? 160 : undefined,
+                    padding: 0,
+                    margin: 0,
+                    border: 'none',
+                    resize: 'none',
+                    background: 'transparent',
+                    color,
+                    fontFamily: 'var(--gn-font-mono)',
+                    fontSize,
+                    lineHeight: 1.6,
+                    outline: 'none',
+                    boxSizing: 'border-box',
+                    overflow: 'auto',
+                }}
+            />
+        </div>
+    );
+    const toolbarHideButton = (
+        <Tooltip title={hideTooltipTitle}>
+            <Button
+                className={isV2Ui ? 'gn-v2-query-result-toolbar-hide' : undefined}
+                icon={<EyeInvisibleOutlined />}
+                onClick={onHide}
+            >
+                <span>{t('query_editor.results_panel.action.hide')}</span>
+                {isV2Ui && toggleShortcutLabel && (
+                    <span className="gn-v2-toolbar-kbd">{toggleShortcutLabel}</span>
+                )}
+            </Button>
+        </Tooltip>
+    );
+
+    function buildResultTabMenuItems(key: string, index: number): MenuProps['items'] {
+        return [
+            {
+                key: 'close-other',
+                label: t('query_editor.results_panel.menu.close_other'),
+                disabled: resultSets.length <= 1,
+                onClick: () => onCloseOtherResultTabs(key),
+            },
+            {
+                key: 'close-left',
+                label: t('query_editor.results_panel.menu.close_left'),
+                disabled: index <= 0,
+                onClick: () => onCloseResultTabsToLeft(key),
+            },
+            {
+                key: 'close-right',
+                label: t('query_editor.results_panel.menu.close_right'),
+                disabled: index >= resultSets.length - 1,
+                onClick: () => onCloseResultTabsToRight(key),
+            },
+            { type: 'divider' },
+            {
+                key: 'close-all',
+                label: t('query_editor.results_panel.menu.close_all'),
+                disabled: resultSets.length === 0,
+                onClick: onCloseAllResultTabs,
+            },
+        ];
+    }
+
+    const buildResultTabItems = () => resultSets.map((rs, idx) => ({
+        key: rs.key,
+        label: (
+            <Dropdown
+                menu={{ items: buildResultTabMenuItems(rs.key, idx) }}
+                trigger={['contextMenu']}
+                rootClassName={isV2Ui ? 'gn-v2-tab-context-menu-popup' : undefined}
+            >
+                <div
+                    className="query-result-tab-label"
+                    onContextMenu={(event) => {
+                        event.preventDefault();
+                    }}
+                >
+                    <Tooltip title={rs.sql}>
+                        <span className="query-result-tab-text">
+                            {rs.resultType === 'message'
+                                ? t('query_editor.results_panel.tab.message', { index: idx + 1 })
+                                : t('query_editor.results_panel.tab.result', { index: idx + 1 })}
+                        </span>
+                    </Tooltip>
+                    {(() => {
+                        if (rs.resultType === 'message') {
+                            return <span className="query-result-tab-count">i</span>;
+                        }
+                        if (isAffectedRowsResult(rs)) {
+                            return <span className="query-result-tab-count">✓</span>;
+                        }
+                        if (!Array.isArray(rs.rows)) {
+                            return null;
+                        }
+                        return <span className="query-result-tab-count">{rs.rows.length}</span>;
+                    })()}
+                    <Tooltip title={t('query_editor.result.close')}>
+                        <span
+                            className="query-result-tab-close"
+                            onClick={(e) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                onCloseResult(rs.key);
+                            }}
+                        >
+                            <CloseOutlined style={{ fontSize: 12 }} />
+                        </span>
+                    </Tooltip>
+                </div>
+            </Dropdown>
+        ),
+        children: (() => {
+            if (rs.resultType === 'message') {
+                const messageText = (rs.messages || []).join('\n');
+                return (
+                    <div className={isV2Ui ? 'gn-v2-query-success' : undefined} style={{
+                        flex: 1, minHeight: 0, display: 'flex', justifyContent: 'flex-start',
+                        flexDirection: 'column', gap: 12, padding: 24, color: '#666', userSelect: 'text',
+                        overflow: 'hidden',
+                    }}>
+                        {renderMessageBlock({
+                            text: messageText,
+                            title: t('query_editor.results_panel.message.title'),
+                            fontSize: 'var(--gn-font-size-mono, 13px)',
+                            fillHeight: true,
+                            color: darkMode ? '#d4d4d4' : '#333',
+                        })}
+                    </div>
+                );
+            }
+            if (isAffectedRowsResult(rs)) {
+                const affected = Number(rs.rows[0]?.affectedRows ?? 0);
+                const messageText = Array.isArray(rs.messages) ? rs.messages.join('\n') : '';
+                return (
+                    <div className={isV2Ui ? 'gn-v2-query-success' : undefined} style={{
+                        flex: 1, minHeight: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        flexDirection: 'column', gap: 8, color: '#666', userSelect: 'text',
+                    }}>
+                        <span style={{ fontSize: 36, color: '#52c41a' }}>✓</span>
+                        <span style={{ fontSize: 14, fontWeight: 500 }}>{t('query_editor.result.execution_success')}</span>
+                        <span style={{ fontSize: 13, color: '#999' }}>{t('query_editor.result.affected_rows', { count: affected })}</span>
+                        {messageText
+                            ? renderMessageBlock({
+                                text: messageText,
+                                fontSize: 'var(--gn-font-size-mono, 12px)',
+                                compact: true,
+                                maxWidth: 720,
+                                color: darkMode ? '#d4d4d4' : '#666',
+                                marginTop: 8,
+                            })
+                            : null}
+                    </div>
+                );
+            }
+            return (
+                <div style={{ flex: 1, minHeight: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+                    {Array.isArray(rs.messages) && rs.messages.length > 0
+                        ? (
+                            <div style={{ flex: '0 0 auto', margin: '8px 8px 0' }}>
+                                {renderMessageBlock({
+                                    text: rs.messages.join('\n'),
+                                    fontSize: 'var(--gn-font-size-mono, 12px)',
+                                    compact: true,
+                                    color: darkMode ? '#d4d4d4' : '#666',
+                                })}
+                            </div>
+                        )
+                        : null}
+                    <DataGrid
+                        data={rs.rows}
+                        columnNames={rs.columns}
+                        loading={loading || rs.page?.loading === true}
+                        tableName={rs.tableName}
+                        exportScope="queryResult"
+                        resultSql={rs.exportSql || rs.sql}
+                        resultExportAllSql={rs.page?.exportAllSql}
+                        dbName={currentDb}
+                        connectionId={currentConnectionId}
+                        pkColumns={rs.pkColumns}
+                        editLocator={rs.editLocator}
+                        showRowNumberColumn={rs.showRowNumberColumn}
+                        onReload={() => {
+                            if (rs.page) {
+                                onResultPageChange(rs.key, rs.page.current, rs.page.pageSize);
+                                return;
+                            }
+                            onReloadResult(rs.key, rs.sql);
+                        }}
+                        pagination={rs.page ? {
+                            current: rs.page.current,
+                            pageSize: rs.page.pageSize,
+                            total: rs.page.total,
+                            totalKnown: rs.page.totalKnown,
+                        } : undefined}
+                        onPageChange={rs.page ? ((page, size) => onResultPageChange(rs.key, page, size)) : undefined}
+                        readOnly={rs.readOnly}
+                        toolbarExtraActions={resolvedResultSetKey === rs.key ? toolbarHideButton : null}
+                    />
+                </div>
+            );
+        })(),
+    }));
+
+    const resultTabItems = buildResultTabItems();
+    const logTabItem = shouldShowSqlLogTab
+        ? {
+            key: QUERY_EDITOR_SQL_LOG_TAB_KEY,
+            label: (
+                <Tooltip title={t('log_panel.title')}>
+                    <div className="query-result-tab-label">
+                        <BugOutlined style={{ fontSize: 12 }} />
+                        <span className="query-result-tab-text">{t('log_panel.short_title')}</span>
+                        <span className="query-result-tab-count">{logTabCountLabel}</span>
+                    </div>
+                </Tooltip>
+            ),
+            children: (
+                <LogPanel
+                    variant="embedded"
+                    executionError={executionError}
+                    onDiagnoseExecutionError={executionError ? onDiagnoseExecutionError : undefined}
+                />
+            ),
+        }
+        : null;
+    const tabItems = logTabItem ? [logTabItem, ...resultTabItems] : resultTabItems;
+
+    const resolvedActiveResultKey = (() => {
+        if (activeResultKey && tabItems.some((item) => item.key === activeResultKey)) {
+            return activeResultKey;
+        }
+        if (resultSets[0]?.key) {
+            return resultSets[0].key;
+        }
+        return shouldShowSqlLogTab ? QUERY_EDITOR_SQL_LOG_TAB_KEY : '';
+    })();
+    const activeResultSet = resultSets.find((rs) => rs.key === resolvedActiveResultKey) || null;
+    const activeResultUsesDataGrid = Boolean(
+        activeResultSet &&
+        activeResultSet.resultType !== 'message' &&
+        !isAffectedRowsResult(activeResultSet),
+    );
+
+    const hideButton = (
+        <Tooltip title={hideTooltipTitle}>
+            <Button
+                className="query-result-panel-hide"
+                type="text"
+                size="small"
+                icon={<EyeInvisibleOutlined />}
+                onClick={onHide}
+            >
+                {t('query_editor.results_panel.action.hide')}
+            </Button>
+        </Tooltip>
+    );
+
+    const tabsHideButton = (
+        <Tooltip title={hideTooltipTitle}>
+            <Button
+                aria-label={t('query_editor.results_panel.aria.hide')}
+                className="query-result-panel-hide query-result-panel-hide-compact"
+                type="text"
+                size="small"
+                icon={<EyeInvisibleOutlined />}
+                onClick={onHide}
+            />
+        </Tooltip>
+    );
+    const tabsExtraContent = !activeResultUsesDataGrid
+        ? {
+            right: (
+                <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                    {tabsHideButton}
+                </div>
+            ),
+        }
+        : undefined;
+
+    return (
+        <>
+            <style>{`
+              .query-result-tabs {
+                flex: 1 1 auto;
+                min-height: 0;
+                display: flex;
+                flex-direction: column;
+                overflow: hidden;
+              }
+              .query-result-tabs .ant-tabs-nav {
+                flex: 0 0 auto;
+                margin: 0;
+                min-height: 38px;
+                padding-right: 8px;
+              }
+              .query-result-tabs .ant-tabs-nav-wrap {
+                flex: 0 1 auto;
+                min-width: 0;
+              }
+              .query-result-tabs .ant-tabs-extra-content {
+                display: inline-flex;
+                align-items: center;
+                padding-left: 8px;
+              }
+              .query-result-tabs .ant-tabs-nav-list {
+                align-items: center;
+                width: auto;
+              }
+              .query-result-tabs .ant-tabs-tab {
+                width: auto !important;
+                min-width: 0 !important;
+                max-width: 148px !important;
+                height: 30px !important;
+                min-height: 30px;
+                margin: 4px 6px 4px 0 !important;
+                padding: 0 9px !important;
+                border-radius: 999px !important;
+                border: 0.5px solid transparent !important;
+                border-right: 0.5px solid transparent !important;
+                align-items: center !important;
+                justify-content: center !important;
+              }
+              .query-result-tabs .ant-tabs-tab-btn {
+                width: auto !important;
+                height: 100%;
+                max-width: 100%;
+                display: inline-flex !important;
+                align-items: center !important;
+                justify-content: center !important;
+                font-size: 14px !important;
+                line-height: 1 !important;
+              }
+              .query-result-tabs .ant-tabs-tab.ant-tabs-tab-active::after {
+                display: none;
+              }
+              .query-result-tabs .ant-tabs-content-holder {
+                flex: 1 1 auto;
+                overflow: hidden;
+                min-height: 0;
+                display: flex;
+                flex-direction: column;
+              }
+              .query-result-tabs .ant-tabs-content {
+                flex: 1 1 auto;
+                min-height: 0;
+                display: flex;
+                flex-direction: column;
+              }
+              .query-result-tabs .ant-tabs-tabpane {
+                flex: 1 1 auto;
+                min-height: 0;
+                display: flex;
+                flex-direction: column;
+                overflow: hidden;
+              }
+              .query-result-tabs .ant-tabs-tabpane > div {
+                flex: 1 1 auto;
+                min-height: 0;
+              }
+              .query-result-tabs .ant-tabs-tabpane-hidden {
+                display: none !important;
+              }
+              .query-result-tabs .ant-tabs-ink-bar {
+                transition: none !important;
+              }
+              .query-result-tab-label {
+                display: inline-flex;
+                align-items: center;
+                gap: 5px;
+                min-width: 0;
+                max-width: 126px;
+                height: 100%;
+                line-height: 1;
+                user-select: none;
+                -webkit-user-select: none;
+              }
+              .query-result-tab-text {
+                min-width: 0;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+                font-size: 14px;
+                font-weight: 700;
+              }
+              .query-result-tab-count {
+                flex: 0 0 auto;
+                min-width: 17px;
+                height: 17px;
+                padding: 0 5px;
+                border-radius: 999px;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                background: rgba(148, 163, 184, 0.16);
+                color: inherit;
+                font-size: 11px;
+                font-weight: 700;
+                line-height: 17px;
+              }
+              .query-result-tab-close {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                width: 16px;
+                height: 16px;
+                border-radius: 999px;
+                color: #999;
+                cursor: pointer;
+                flex: 0 0 auto;
+              }
+              .query-result-tab-close:hover {
+                background: rgba(0, 0, 0, 0.06);
+                color: #666;
+              }
+              .query-result-panel-header {
+                flex: 0 0 auto;
+                min-height: 38px;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 12px;
+                padding: 0 12px;
+                border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+                background: rgba(255, 255, 255, 0.9);
+              }
+              .query-result-panel-header-title {
+                font-size: 13px;
+                font-weight: 600;
+                color: #666;
+              }
+              .query-result-panel-hide {
+                display: inline-flex;
+                align-items: center;
+                gap: 4px;
+              }
+              .query-result-panel-hide-compact {
+                min-width: 28px;
+                padding: 0 6px;
+                justify-content: center;
+              }
+            `}</style>
+            <div
+                className={isV2Ui ? 'gn-v2-query-results' : undefined}
+                style={{ position: 'relative', flex: 1, minHeight: 0, overflow: 'hidden', padding: 0, display: 'flex', flexDirection: 'column' }}
+            >
+                {tabItems.length > 0 ? (
+                    <Tabs
+                        className="query-result-tabs"
+                        activeKey={resolvedActiveResultKey}
+                        onChange={onActiveResultKeyChange}
+                        animated={false}
+                        style={{ flex: 1, minHeight: 0 }}
+                        tabBarExtraContent={tabsExtraContent}
+                        items={tabItems}
+                    />
+                ) : executionError ? (
+                    <>
+                        <div className={isV2Ui ? 'query-result-panel-header gn-v2-query-result-panel-header' : 'query-result-panel-header'}>
+                            <span className="query-result-panel-header-title">{t('query_editor.results_panel.panel.title')}</span>
+                            {hideButton}
+                        </div>
+                        <div className={isV2Ui ? 'gn-v2-query-error' : undefined} style={{ flex: 1, minHeight: 0, padding: 24, display: 'flex', flexDirection: 'column', gap: 16, background: darkMode ? '#1e1e1e' : '#fafafa', overflow: 'auto' }}>
+                            <div style={{ color: '#ff4d4f', fontWeight: 'bold', fontSize: 16, display: 'flex', alignItems: 'center', gap: 8 }}>
+                                <CloseOutlined />
+                                <span>{t('query_editor.result.execution_failed')}</span>
+                            </div>
+                            <div className="custom-scrollbar" style={{ padding: 16, background: darkMode ? '#2d1a1a' : '#fff2f0', border: `1px solid ${darkMode ? '#5c2020' : '#ffccc7'}`, borderRadius: 6, color: darkMode ? '#ffa39e' : '#cf1322', fontFamily: 'var(--gn-font-mono)', fontSize: 'var(--gn-font-size-mono, 13px)', whiteSpace: 'pre-wrap', wordBreak: 'break-all', maxHeight: '40vh', overflow: 'auto' }}>
+                                {executionError}
+                            </div>
+                            <div style={{ marginTop: 8 }}>
+                                <Button
+                                    type="primary"
+                                    icon={<RobotOutlined />}
+                                    style={{ background: '#818cf8', borderColor: '#818cf8', boxShadow: '0 2px 0 rgba(129, 140, 248, 0.2)' }}
+                                    onClick={onDiagnoseExecutionError}
+                                >
+                                    {t('query_editor.result.ai_diagnose')}
+                                </Button>
+                            </div>
+                        </div>
+                    </>
+                ) : (
+                    <>
+                        <div className={isV2Ui ? 'query-result-panel-header gn-v2-query-result-panel-header' : 'query-result-panel-header'}>
+                            <span className="query-result-panel-header-title">{t('query_editor.results_panel.panel.title')}</span>
+                            {hideButton}
+                        </div>
+                        <div className={isV2Ui ? 'gn-v2-query-empty' : undefined} style={{ flex: 1, minHeight: 0 }}>
+                            {isV2Ui && (
+                                <div>
+                                    <strong>{t('query_editor.empty_state.title')}</strong>
+                                    <span>{t('query_editor.empty_state.description')}</span>
+                                </div>
+                            )}
+                        </div>
+                    </>
+                )}
+            </div>
+        </>
+    );
+};
+
+export default QueryEditorResultsPanel;

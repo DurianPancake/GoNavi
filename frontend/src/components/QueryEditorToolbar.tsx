@@ -1,0 +1,436 @@
+import React from "react";
+import { Button, Dropdown, Select, Tooltip, type MenuProps } from "antd";
+import {
+  EyeInvisibleOutlined,
+  EyeOutlined,
+  FormatPainterOutlined,
+  PlayCircleOutlined,
+  RobotOutlined,
+  SaveOutlined,
+  SettingOutlined,
+  StopOutlined,
+} from "@ant-design/icons";
+
+import { t as defaultTranslate } from '../i18n';
+import { useOptionalI18n } from '../i18n/provider';
+import type { SavedConnection } from "../types";
+import {
+  getShortcutDisplayLabel,
+  type ShortcutPlatform,
+  type ShortcutPlatformBinding,
+} from "../utils/shortcuts";
+import QueryEditorTransactionSettings, {
+  type SqlEditorCommitMode,
+} from "./QueryEditorTransactionSettings";
+
+type QueryEditorToolbarProps = {
+  isV2Ui: boolean;
+  currentConnectionId: string;
+  currentDb: string;
+  queryCapableConnections: SavedConnection[];
+  dbList: string[];
+  maxRows: number;
+  sqlEditorCommitMode: SqlEditorCommitMode;
+  sqlEditorAutoCommitDelayMs: number;
+  pendingTransactionToolbar: React.ReactNode;
+  runQueryShortcutBinding: ShortcutPlatformBinding;
+  saveQueryShortcutBinding: ShortcutPlatformBinding;
+  toggleQueryResultsPanelShortcutBinding: ShortcutPlatformBinding;
+  activeShortcutPlatform: ShortcutPlatform;
+  isResultPanelVisible: boolean;
+  loading: boolean;
+  saveMoreMenuItems: MenuProps["items"];
+  formatSettingsMenu: MenuProps["items"];
+  onConnectionChange: (connectionId: string) => void;
+  onDatabaseChange: (dbName: string) => void;
+  onMaxRowsChange: (maxRows: number) => void;
+  onCommitModeChange: (mode: SqlEditorCommitMode) => void;
+  onAutoCommitDelayMsChange: (delayMs: number) => void;
+  onCaptureEditorCursorPosition: () => void;
+  onRun: () => void;
+  onCancel: () => void;
+  onQuickSave: () => void;
+  onFormat: () => void;
+  onToggleResultPanelVisibility: () => void;
+  onAIAction: (action: "generate" | "explain" | "optimize" | "schema") => void;
+};
+
+const FULL_NAME_TOOLTIP_DELAY_SECONDS = 1;
+
+type FullNameSelectOption = {
+  label: string;
+  value: string;
+  fullName: string;
+};
+
+const renderFullNameSelectTooltip = (fullName: React.ReactNode) => {
+  const fullNameText = String(fullName ?? "");
+
+  return (
+    <Tooltip
+      title={fullNameText}
+      mouseEnterDelay={FULL_NAME_TOOLTIP_DELAY_SECONDS}
+      placement="topLeft"
+    >
+      <span
+        className="gn-query-toolbar-select-full-name"
+        aria-label={fullNameText}
+      >
+        {fullNameText}
+      </span>
+    </Tooltip>
+  );
+};
+
+const QueryEditorToolbar: React.FC<QueryEditorToolbarProps> = ({
+  isV2Ui,
+  currentConnectionId,
+  currentDb,
+  queryCapableConnections,
+  dbList,
+  maxRows,
+  sqlEditorCommitMode,
+  sqlEditorAutoCommitDelayMs,
+  pendingTransactionToolbar,
+  runQueryShortcutBinding,
+  saveQueryShortcutBinding,
+  toggleQueryResultsPanelShortcutBinding,
+  activeShortcutPlatform,
+  isResultPanelVisible,
+  loading,
+  saveMoreMenuItems,
+  formatSettingsMenu,
+  onConnectionChange,
+  onDatabaseChange,
+  onMaxRowsChange,
+  onCommitModeChange,
+  onAutoCommitDelayMsChange,
+  onCaptureEditorCursorPosition,
+  onRun,
+  onCancel,
+  onQuickSave,
+  onFormat,
+  onToggleResultPanelVisibility,
+  onAIAction,
+}) => {
+  const i18n = useOptionalI18n();
+  const t = i18n?.t ?? defaultTranslate;
+  const baseMoreMenuItems = saveMoreMenuItems ?? [];
+  const connectionSelectOptions: FullNameSelectOption[] =
+    queryCapableConnections.map((connection) => ({
+      label: connection.name,
+      value: connection.id,
+      fullName: connection.name,
+    }));
+  const databaseSelectOptions: FullNameSelectOption[] = dbList.map((db) => ({
+    label: db,
+    value: db,
+    fullName: db,
+  }));
+  const toggleResultPanelShortcutLabel =
+    toggleQueryResultsPanelShortcutBinding.enabled &&
+    toggleQueryResultsPanelShortcutBinding.combo
+      ? getShortcutDisplayLabel(
+          toggleQueryResultsPanelShortcutBinding.combo,
+          activeShortcutPlatform,
+        )
+      : "";
+  const toggleResultPanelTitle =
+    toggleQueryResultsPanelShortcutBinding.enabled &&
+    toggleQueryResultsPanelShortcutBinding.combo
+      ? t(
+          isResultPanelVisible
+            ? "query_editor.action.hide_results_panel_with_shortcut"
+            : "query_editor.action.show_results_panel_with_shortcut",
+          { shortcut: toggleResultPanelShortcutLabel },
+        )
+      : isResultPanelVisible
+        ? t("query_editor.action.hide_results_panel")
+        : t("query_editor.action.show_results_panel");
+  const aiMenuItems: MenuProps["items"] = [
+    {
+      key: "ai-generate",
+      label: t("query_editor.action.ai_generate_sql_menu"),
+      icon: <RobotOutlined />,
+      onClick: () => onAIAction("generate"),
+    },
+    {
+      key: "ai-explain",
+      label: t("query_editor.action.ai_explain_sql_menu"),
+      icon: <RobotOutlined />,
+      onClick: () => onAIAction("explain"),
+    },
+    {
+      key: "ai-optimize",
+      label: t("query_editor.action.ai_optimize_sql_menu"),
+      icon: <RobotOutlined />,
+      onClick: () => onAIAction("optimize"),
+    },
+    { type: "divider" as const },
+    {
+      key: "ai-schema",
+      label: t("query_editor.action.ai_schema_analysis"),
+      icon: <RobotOutlined />,
+      onClick: () => onAIAction("schema"),
+    },
+  ];
+  const moreMenuItems: MenuProps["items"] = isV2Ui
+    ? [
+        ...baseMoreMenuItems,
+        ...(baseMoreMenuItems.length > 0 ? [{ type: "divider" as const }] : []),
+        {
+          key: "toggle-result-panel",
+          label: toggleResultPanelTitle,
+          icon: isResultPanelVisible ? (
+            <EyeInvisibleOutlined />
+          ) : (
+            <EyeOutlined />
+          ),
+          onClick: onToggleResultPanelVisibility,
+        },
+      ]
+    : baseMoreMenuItems;
+  const selects = (
+    <div
+      className={isV2Ui ? "gn-v2-query-toolbar-selects" : undefined}
+      style={{
+        display: "flex",
+        gap: "8px",
+        flexShrink: 0,
+        alignItems: "center",
+      }}
+    >
+      <Select
+        className={
+          isV2Ui
+            ? "gn-v2-query-toolbar-select gn-v2-query-toolbar-connection-select"
+            : undefined
+        }
+        style={isV2Ui ? undefined : { width: 150 }}
+        placeholder={t("query_editor.placeholder.connection")}
+        value={currentConnectionId}
+        onChange={onConnectionChange}
+        options={connectionSelectOptions}
+        optionFilterProp="label"
+        optionRender={(option) => renderFullNameSelectTooltip(option.data.fullName)}
+        labelRender={(option) => renderFullNameSelectTooltip(option.label ?? option.value)}
+        showSearch
+      />
+      <Select
+        className={
+          isV2Ui
+            ? "gn-v2-query-toolbar-select gn-v2-query-toolbar-database-select"
+            : undefined
+        }
+        style={isV2Ui ? undefined : { width: 200 }}
+        placeholder={t("query_editor.placeholder.database")}
+        value={currentDb}
+        onChange={onDatabaseChange}
+        options={databaseSelectOptions}
+        optionFilterProp="label"
+        optionRender={(option) => renderFullNameSelectTooltip(option.data.fullName)}
+        labelRender={(option) => renderFullNameSelectTooltip(option.label ?? option.value)}
+        showSearch
+      />
+      <Tooltip title={t("query_editor.max_rows.tooltip")}>
+        <Select
+          className={
+            isV2Ui
+              ? "gn-v2-query-toolbar-select gn-v2-query-toolbar-max-rows-select"
+              : undefined
+          }
+          style={isV2Ui ? undefined : { width: 170 }}
+          value={maxRows}
+          onChange={(val) => onMaxRowsChange(Number(val))}
+          options={[
+            { label: t("query_editor.max_rows.option_500"), value: 500 },
+            { label: t("query_editor.max_rows.option_1000"), value: 1000 },
+            { label: t("query_editor.max_rows.option_5000"), value: 5000 },
+            { label: t("query_editor.max_rows.option_20000"), value: 20000 },
+            { label: t("query_editor.max_rows.option_unlimited"), value: 0 },
+          ]}
+        />
+      </Tooltip>
+      <QueryEditorTransactionSettings
+        isV2Ui={isV2Ui}
+        commitMode={sqlEditorCommitMode}
+        autoCommitDelayMs={sqlEditorAutoCommitDelayMs}
+        onCommitModeChange={onCommitModeChange}
+        onAutoCommitDelayMsChange={onAutoCommitDelayMsChange}
+      />
+      {!isV2Ui && pendingTransactionToolbar}
+    </div>
+  );
+
+  const actions = (
+    <div
+      className={isV2Ui ? "gn-v2-query-toolbar-actions" : undefined}
+      style={{
+        display: "flex",
+        gap: "8px",
+        flexShrink: 0,
+        alignItems: "center",
+      }}
+    >
+      <div
+        className={isV2Ui ? "gn-v2-query-toolbar-action-group" : undefined}
+        style={{ display: "flex", gap: "8px", alignItems: "center" }}
+      >
+        <Tooltip
+          title={
+            runQueryShortcutBinding.enabled && runQueryShortcutBinding.combo
+              ? t("query_editor.action.run_with_shortcut", {
+                  shortcut: getShortcutDisplayLabel(
+                    runQueryShortcutBinding.combo,
+                    activeShortcutPlatform,
+                  ),
+                })
+              : t("query_editor.action.run")
+          }
+        >
+          <Button
+            className={isV2Ui ? "gn-v2-query-toolbar-run-action" : undefined}
+            type="primary"
+            icon={<PlayCircleOutlined />}
+            onMouseDown={onCaptureEditorCursorPosition}
+            onClick={onRun}
+            loading={loading}
+          >
+            {t("query_editor.action.run")}
+          </Button>
+        </Tooltip>
+        {loading && (
+          <Button
+            type="primary"
+            danger
+            icon={<StopOutlined />}
+            onClick={onCancel}
+          >
+            {t("query_editor.action.stop")}
+          </Button>
+        )}
+      </div>
+      {isV2Ui && pendingTransactionToolbar}
+      <div
+        className={isV2Ui ? "gn-v2-query-toolbar-action-pair" : undefined}
+        style={{ display: "flex", gap: "8px", alignItems: "center" }}
+      >
+        <Tooltip
+          title={
+            saveQueryShortcutBinding.enabled && saveQueryShortcutBinding.combo
+              ? t("query_editor.action.save_with_shortcut", {
+                  shortcut: getShortcutDisplayLabel(
+                    saveQueryShortcutBinding.combo,
+                    activeShortcutPlatform,
+                  ),
+                })
+              : t("query_editor.action.save")
+          }
+        >
+          <Button icon={<SaveOutlined />} onClick={onQuickSave}>
+            {t("query_editor.action.save")}
+          </Button>
+        </Tooltip>
+        <Dropdown
+          menu={{ items: aiMenuItems }}
+          placement="bottomRight"
+          trigger={["click"]}
+        >
+          <Button
+            className={isV2Ui ? "gn-v2-query-toolbar-ai-action" : undefined}
+            icon={<RobotOutlined />}
+            style={{ color: "#818cf8" }}
+          >
+            AI
+          </Button>
+        </Dropdown>
+        <Dropdown
+          menu={{ items: moreMenuItems }}
+          placement="bottomRight"
+          trigger={["click"]}
+        >
+          <Button>{t("query_editor.action.more")}</Button>
+        </Dropdown>
+      </div>
+
+      <div
+        className={isV2Ui ? "gn-v2-query-toolbar-action-pair" : undefined}
+        style={{ display: "flex", gap: "8px", alignItems: "center" }}
+      >
+        <Tooltip title={t("query_editor.action.format_sql")}>
+          <Button icon={<FormatPainterOutlined />} onClick={onFormat}>
+            {t("query_editor.action.format")}
+          </Button>
+        </Tooltip>
+        <Dropdown
+          menu={{ items: formatSettingsMenu }}
+          placement="bottomRight"
+          trigger={["click"]}
+        >
+          <Button
+            className={isV2Ui ? "gn-v2-query-toolbar-icon-action" : undefined}
+            icon={<SettingOutlined />}
+          />
+        </Dropdown>
+      </div>
+
+      {!isV2Ui && (
+        <Tooltip title={toggleResultPanelTitle}>
+          <Button
+            icon={
+              isResultPanelVisible ? <EyeInvisibleOutlined /> : <EyeOutlined />
+            }
+            onClick={onToggleResultPanelVisibility}
+          >
+            {t("query_editor.action.results")}
+          </Button>
+        </Tooltip>
+      )}
+    </div>
+  );
+
+  if (!isV2Ui) {
+    return (
+      <div
+        className={undefined}
+        style={{
+          padding: "4px 8px 8px",
+          display: "flex",
+          gap: "8px",
+          flexShrink: 0,
+          alignItems: "center",
+        }}
+      >
+        {selects}
+        {actions}
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="gn-v2-query-toolbar"
+      style={{
+        padding: "4px 8px 8px",
+        display: "flex",
+        gap: "8px",
+        flexShrink: 0,
+      }}
+    >
+      <div
+        className="gn-v2-query-toolbar-main"
+        style={{
+          display: "flex",
+          gap: "8px",
+          flexShrink: 0,
+          alignItems: "center",
+        }}
+      >
+        {selects}
+        {actions}
+      </div>
+    </div>
+  );
+};
+
+export default QueryEditorToolbar;

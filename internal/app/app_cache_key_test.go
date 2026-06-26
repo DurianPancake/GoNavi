@@ -43,6 +43,28 @@ func TestGetCacheKey_IgnoreConnectionID(t *testing.T) {
 	}
 }
 
+func TestGetCacheKey_IgnoreKeepAliveSettings(t *testing.T) {
+	base := connection.ConnectionConfig{
+		Type:                     "postgres",
+		Host:                     "db.local",
+		Port:                     5432,
+		User:                     "postgres",
+		Password:                 "secret",
+		Database:                 "app",
+		KeepAliveEnabled:         false,
+		KeepAliveIntervalMinutes: 240,
+	}
+	modified := base
+	modified.KeepAliveEnabled = true
+	modified.KeepAliveIntervalMinutes = 15
+
+	left := getCacheKey(base)
+	right := getCacheKey(modified)
+	if left != right {
+		t.Fatalf("expected same cache key when only keepalive settings differ, got %s vs %s", left, right)
+	}
+}
+
 func TestGetCacheKey_DuckDBHostAndDatabaseEquivalent(t *testing.T) {
 	withHost := connection.ConnectionConfig{
 		Type: "duckdb",
@@ -78,5 +100,183 @@ func TestGetCacheKey_KeepDatabaseIsolation(t *testing.T) {
 	right := getCacheKey(b)
 	if left == right {
 		t.Fatalf("expected different cache key for different database targets")
+	}
+}
+
+func TestGetCacheKey_KeepConnectionParamsIsolation(t *testing.T) {
+	base := connection.ConnectionConfig{
+		Type:             "mysql",
+		Host:             "127.0.0.1",
+		Port:             3306,
+		User:             "root",
+		Password:         "root",
+		Database:         "app",
+		ConnectionParams: "charset=utf8",
+	}
+	modified := base
+	modified.ConnectionParams = "charset=utf8mb4"
+
+	left := getCacheKey(base)
+	right := getCacheKey(modified)
+	if left == right {
+		t.Fatalf("expected different cache key for different connection params")
+	}
+}
+
+func TestGetCacheKey_KeepClickHouseProtocolIsolation(t *testing.T) {
+	base := connection.ConnectionConfig{
+		Type:               "clickhouse",
+		Host:               "clickhouse.local",
+		Port:               8125,
+		User:               "default",
+		Database:           "default",
+		ClickHouseProtocol: "native",
+	}
+	modified := base
+	modified.ClickHouseProtocol = "http"
+
+	left := getCacheKey(base)
+	right := getCacheKey(modified)
+	if left == right {
+		t.Fatalf("expected different cache key for different ClickHouse protocols")
+	}
+}
+
+func TestGetCacheKey_KeepOceanBaseProtocolIsolation(t *testing.T) {
+	base := connection.ConnectionConfig{
+		Type:             "oceanbase",
+		Host:             "ob.local",
+		Port:             2881,
+		User:             "sys@oracle001",
+		Database:         "ORCL",
+		ConnectionParams: "protocol=mysql",
+	}
+	modified := base
+	modified.ConnectionParams = "protocol=oracle"
+
+	left := getCacheKey(base)
+	right := getCacheKey(modified)
+	if left == right {
+		t.Fatalf("expected different cache key for different OceanBase protocols")
+	}
+}
+
+func TestGetCacheKey_KeepOceanBaseExplicitProtocolIsolation(t *testing.T) {
+	base := connection.ConnectionConfig{
+		Type:     "oceanbase",
+		Host:     "ob.local",
+		Port:     2881,
+		User:     "sys@oracle001",
+		Database: "ORCL",
+	}
+	modified := base
+	modified.OceanBaseProtocol = "oracle"
+
+	left := getCacheKey(base)
+	right := getCacheKey(modified)
+	if left == right {
+		t.Fatalf("expected different cache key for explicit OceanBase Oracle protocol")
+	}
+}
+
+func TestGetCacheKey_KeepOceanBaseDefaultProtocolEquivalentToMySQL(t *testing.T) {
+	base := connection.ConnectionConfig{
+		Type:     "oceanbase",
+		Host:     "ob.local",
+		Port:     2881,
+		User:     "root@test",
+		Database: "app",
+	}
+	modified := base
+	modified.ConnectionParams = "protocol=mysql"
+
+	left := getCacheKey(base)
+	right := getCacheKey(modified)
+	if left != right {
+		t.Fatalf("expected default OceanBase protocol to equal mysql, got %s vs %s", left, right)
+	}
+}
+
+func TestGetCacheKey_KeepOceanBaseDefaultProtocolEquivalentToExplicitMySQL(t *testing.T) {
+	base := connection.ConnectionConfig{
+		Type:     "oceanbase",
+		Host:     "ob.local",
+		Port:     2881,
+		User:     "root@test",
+		Database: "app",
+	}
+	modified := base
+	modified.OceanBaseProtocol = "mysql"
+
+	left := getCacheKey(base)
+	right := getCacheKey(modified)
+	if left != right {
+		t.Fatalf("expected default OceanBase protocol to equal explicit mysql, got %s vs %s", left, right)
+	}
+}
+
+func TestGetCacheKey_OceanBaseProtocolParamWinsOverAliases(t *testing.T) {
+	base := connection.ConnectionConfig{
+		Type:             "oceanbase",
+		Host:             "ob.local",
+		Port:             2881,
+		User:             "root@test",
+		Database:         "app",
+		ConnectionParams: "protocol=mysql",
+	}
+	modified := base
+	modified.ConnectionParams = "protocol=mysql&tenantMode=oracle"
+
+	left := getCacheKey(base)
+	right := getCacheKey(modified)
+	if left != right {
+		t.Fatalf("expected explicit protocol=mysql to win over alias, got %s vs %s", left, right)
+	}
+}
+
+func TestGetCacheKey_OceanBaseExplicitProtocolOverridesConnectionParams(t *testing.T) {
+	base := connection.ConnectionConfig{
+		Type:             "oceanbase",
+		Host:             "ob.local",
+		Port:             2881,
+		User:             "root@test",
+		Database:         "app",
+		ConnectionParams: "connectTimeout=10",
+	}
+	modified := base
+	modified.OceanBaseProtocol = "mysql"
+	modified.ConnectionParams = "protocol=oracle&connectTimeout=10"
+
+	left := getCacheKey(base)
+	right := getCacheKey(modified)
+	if left != right {
+		t.Fatalf("expected explicit OceanBase protocol=mysql to override params protocol=oracle, got %s vs %s", left, right)
+	}
+}
+
+func TestGetCacheKey_KeepOceanBaseUnsupportedProtocolIsolation(t *testing.T) {
+	base := connection.ConnectionConfig{
+		Type:             "oceanbase",
+		Host:             "ob.local",
+		Port:             2881,
+		User:             "root@test",
+		Database:         "app",
+		ConnectionParams: "protocol=mysql",
+	}
+	modified := base
+	modified.ConnectionParams = "protocol=native"
+
+	left := getCacheKey(base)
+	right := getCacheKey(modified)
+	if left == right {
+		t.Fatalf("expected unsupported OceanBase protocol to stay isolated from MySQL cache key")
+	}
+
+	masked := base
+	masked.OceanBaseProtocol = "mysql"
+	masked.ConnectionParams = "protocol=native"
+
+	if left == getCacheKey(masked) {
+		t.Fatalf("expected unsupported OceanBase params protocol to stay isolated even with explicit mysql")
 	}
 }

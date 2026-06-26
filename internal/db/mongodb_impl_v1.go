@@ -4,7 +4,7 @@ package db
 
 import (
 	"context"
-	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/url"
@@ -41,6 +41,7 @@ func (d *mongoProxyDialer) DialContext(ctx context.Context, network, address str
 }
 
 const defaultMongoPort = 27017
+const mongoObjectIDLocatorColumn = "__gonavi_mongodb_id_locator__"
 
 func normalizeMongoAddress(host string, port int) string {
 	h := strings.TrimSpace(host)
@@ -193,7 +194,7 @@ func applyMongoURI(config connection.ConnectionConfig) connection.ConnectionConf
 
 func (m *MongoDBV1) getURI(config connection.ConnectionConfig) string {
 	if strings.TrimSpace(config.URI) != "" {
-		return strings.TrimSpace(config.URI)
+		return mergeConnectionParamsIntoRawURI(config.URI, config.ConnectionParams, "mongodb", "mongodb+srv")
 	}
 
 	seeds := collectMongoSeeds(config)
@@ -258,6 +259,7 @@ func (m *MongoDBV1) getURI(config connection.ConnectionConfig) string {
 	if authMechanism := strings.TrimSpace(config.MongoAuthMechanism); authMechanism != "" && !noAuth {
 		params.Set("authMechanism", authMechanism)
 	}
+	mergeConnectionParamValues(params, connectionParamsFromText(config.ConnectionParams))
 
 	// 单机模式且未指定副本集名称时，启用 directConnection 避免驱动自动跟随副本集成员发现
 	if strings.TrimSpace(config.Topology) != "replica" && strings.TrimSpace(config.ReplicaSet) == "" && !config.MongoSRV {
@@ -413,12 +415,15 @@ func (m *MongoDBV1) Connect(config connection.ConnectionConfig) error {
 			}
 			uri := m.getURI(attemptConfig)
 			clientOpts := options.Client().ApplyURI(uri)
-			tlsEnabled, tlsInsecure := resolveMongoTLSSettings(attemptConfig)
-			if tlsEnabled {
-				clientOpts.SetTLSConfig(&tls.Config{
-					MinVersion:         tls.VersionTLS12,
-					InsecureSkipVerify: tlsInsecure,
-				})
+			tlsConfig, tlsErr := resolveGenericTLSConfig(attemptConfig)
+			if tlsErr != nil {
+				detail := fmt.Sprintf("%s %sTLS 配置失败: %v", sslLabel, authLabel, tlsErr)
+				errorDetails = append(errorDetails, detail)
+				logger.Warnf("MongoDB TLS 配置失败：%d/%d 模式=%s 凭据=%s 错误=%v", attemptNo, totalAttempts, sslLabel, authLabel, tlsErr)
+				continue
+			}
+			if tlsConfig != nil {
+				clientOpts.SetTLSConfig(tlsConfig)
 			}
 			if attemptConfig.UseProxy {
 				clientOpts.SetDialer(&mongoProxyDialer{proxyConfig: attemptConfig.Proxy})
@@ -924,6 +929,7 @@ func (m *MongoDBV1) execFind(ctx context.Context, cmd bson.D) ([]map[string]inte
 	var skip int64
 	var sortDoc interface{}
 	var projection interface{}
+	var includeObjectIDLocator bool
 
 	for _, elem := range cmd {
 		switch elem.Key {
@@ -939,6 +945,10 @@ func (m *MongoDBV1) execFind(ctx context.Context, cmd bson.D) ([]map[string]inte
 			sortDoc = elem.Value
 		case "projection":
 			projection = elem.Value
+		case "__gonaviIncludeObjectIDLocator":
+			if enabled, ok := elem.Value.(bool); ok {
+				includeObjectIDLocator = enabled
+			}
 		}
 	}
 
@@ -980,6 +990,10 @@ func (m *MongoDBV1) execFind(ctx context.Context, cmd bson.D) ([]map[string]inte
 		}
 		row := make(map[string]interface{})
 		for k, v := range doc {
+			if includeObjectIDLocator && k == "_id" {
+				row[mongoObjectIDLocatorColumn] = buildMongoObjectIDLocatorValue(v)
+				columnSet[mongoObjectIDLocatorColumn] = true
+			}
 			row[k] = convertBsonValue(v)
 			columnSet[k] = true
 		}
@@ -1006,6 +1020,13 @@ func (m *MongoDBV1) execFind(ctx context.Context, cmd bson.D) ([]map[string]inte
 	}
 
 	return data, columns, nil
+}
+
+func buildMongoObjectIDLocatorValue(v interface{}) interface{} {
+	if oid, ok := v.(primitive.ObjectID); ok {
+		return bson.M{"$oid": oid.Hex()}
+	}
+	return convertBsonValue(v)
 }
 
 // execCount 使用原生 Collection.CountDocuments() 执行计数
@@ -1041,7 +1062,16 @@ func (m *MongoDBV1) execCount(ctx context.Context, cmd bson.D) ([]map[string]int
 // convertBsonValue 将 BSON 特殊类型转换为前端可读的 JSON 友好值
 func convertBsonValue(v interface{}) interface{} {
 	switch val := v.(type) {
+	case map[string]interface{}:
+		result := make(map[string]interface{}, len(val))
+		for k, v2 := range val {
+			result[k] = convertBsonValue(v2)
+		}
+		return result
 	case primitive.ObjectID:
+		if converted, ok := encodeMongoExtendedJSONFieldValue(val); ok {
+			return converted
+		}
 		return val.Hex()
 	case bson.M:
 		result := make(map[string]interface{}, len(val))
@@ -1061,9 +1091,73 @@ func convertBsonValue(v interface{}) interface{} {
 			result[i] = convertBsonValue(v2)
 		}
 		return result
+	case []interface{}:
+		result := make([]interface{}, len(val))
+		for i, v2 := range val {
+			result[i] = convertBsonValue(v2)
+		}
+		return result
 	default:
+		if !shouldEncodeMongoExtendedJSONFieldValue(v) {
+			return v
+		}
+		if converted, ok := encodeMongoExtendedJSONFieldValue(v); ok {
+			return converted
+		}
 		return v
 	}
+}
+
+func shouldEncodeMongoExtendedJSONFieldValue(v interface{}) bool {
+	switch v.(type) {
+	case primitive.DateTime,
+		primitive.Decimal128,
+		primitive.Binary,
+		primitive.Regex,
+		primitive.Timestamp,
+		primitive.MaxKey,
+		primitive.MinKey,
+		primitive.Undefined,
+		int32,
+		int64,
+		[]byte,
+		time.Time:
+		return true
+	default:
+		return false
+	}
+}
+
+func encodeMongoExtendedJSONFieldValue(v interface{}) (interface{}, bool) {
+	payload, err := bson.MarshalExtJSON(bson.M{"v": v}, true, false)
+	if err != nil {
+		return nil, false
+	}
+
+	var wrapped map[string]interface{}
+	if err := json.Unmarshal(payload, &wrapped); err != nil {
+		return nil, false
+	}
+
+	converted, ok := wrapped["v"]
+	return converted, ok
+}
+
+func decodeMongoExtendedJSONFieldValue(v interface{}) interface{} {
+	payload, err := json.Marshal(map[string]interface{}{"v": v})
+	if err != nil {
+		return v
+	}
+
+	var wrapped bson.M
+	if err := bson.UnmarshalExtJSON(payload, false, &wrapped); err != nil {
+		return v
+	}
+
+	if converted, ok := wrapped["v"]; ok {
+		return converted
+	}
+	return v
 }
 
 func (m *MongoDBV1) Exec(query string) (int64, error) {
@@ -1200,6 +1294,22 @@ func (m *MongoDBV1) GetTriggers(dbName, tableName string) ([]connection.TriggerD
 	return []connection.TriggerDefinition{}, nil
 }
 
+func copyMongoChangeDocument(row map[string]interface{}) bson.M {
+	doc := bson.M{}
+	for k, v := range row {
+		doc[k] = decodeMongoExtendedJSONFieldValue(v)
+	}
+	return doc
+}
+
+func buildMongoChangeFilter(row map[string]interface{}) bson.M {
+	filter := bson.M{}
+	for k, v := range row {
+		filter[k] = decodeMongoExtendedJSONFieldValue(v)
+	}
+	return filter
+}
+
 // ApplyChanges implements batch changes for MongoDB
 func (m *MongoDBV1) ApplyChanges(tableName string, changes connection.ChangeSet) error {
 	if m.client == nil {
@@ -1213,49 +1323,67 @@ func (m *MongoDBV1) ApplyChanges(tableName string, changes connection.ChangeSet)
 
 	// Process deletes
 	for _, pk := range changes.Deletes {
-		filter := bson.M{}
-		for k, v := range pk {
-			filter[k] = v
-		}
+		filter := buildMongoChangeFilter(pk)
 		if len(filter) > 0 {
-			if _, err := collection.DeleteOne(ctx, filter); err != nil {
+			result, err := collection.DeleteOne(ctx, filter)
+			if err != nil {
 				return fmt.Errorf("删除失败：%v", err)
+			}
+			if result.DeletedCount == 0 {
+				return fmt.Errorf("删除失败：未匹配到文档")
 			}
 		}
 	}
 
 	// Process updates
 	for _, update := range changes.Updates {
-		filter := bson.M{}
-		for k, v := range update.Keys {
-			filter[k] = v
-		}
+		filter := buildMongoChangeFilter(update.Keys)
 		if len(filter) == 0 {
 			return fmt.Errorf("更新操作需要主键条件")
 		}
 
-		updateDoc := bson.M{"$set": bson.M{}}
-		for k, v := range update.Values {
-			updateDoc["$set"].(bson.M)[k] = v
-		}
+		updateDoc := bson.M{"$set": copyMongoChangeDocument(update.Values)}
 
-		if _, err := collection.UpdateOne(ctx, filter, updateDoc); err != nil {
+		result, err := collection.UpdateOne(ctx, filter, updateDoc)
+		if err != nil {
 			return fmt.Errorf("更新失败：%v", err)
 		}
+		if result.MatchedCount == 0 {
+			return fmt.Errorf("更新失败：未匹配到文档")
+		}
 	}
 
-	// Process inserts
-	for _, row := range changes.Inserts {
-		doc := bson.M{}
-		for k, v := range row {
-			doc[k] = v
-		}
+	if err := insertMongoV1Documents(ctx, collection, changes.Inserts); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func insertMongoV1Documents(ctx context.Context, collection *mongo.Collection, rows []map[string]interface{}) error {
+	if len(rows) == 0 {
+		return nil
+	}
+
+	docs := make([]interface{}, 0, len(rows))
+	for _, row := range rows {
+		doc := copyMongoChangeDocument(row)
 		if len(doc) > 0 {
-			if _, err := collection.InsertOne(ctx, doc); err != nil {
-				return fmt.Errorf("插入失败：%v", err)
-			}
+			docs = append(docs, doc)
 		}
 	}
+	if len(docs) == 0 {
+		return nil
+	}
 
+	for start := 0; start < len(docs); start += defaultBatchInsertRows {
+		end := start + defaultBatchInsertRows
+		if end > len(docs) {
+			end = len(docs)
+		}
+		if _, err := collection.InsertMany(ctx, docs[start:end]); err != nil {
+			return fmt.Errorf("插入失败：%v", err)
+		}
+	}
 	return nil
 }

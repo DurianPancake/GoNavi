@@ -1,37 +1,151 @@
-import React, { useState, useEffect } from 'react';
-import Editor from '@monaco-editor/react';
-import { Spin, Alert } from 'antd';
+import React, { useState, useEffect, useRef } from 'react';
+import Editor from './MonacoEditor';
+import { Button, Spin, Alert } from 'antd';
+import { EditOutlined } from '@ant-design/icons';
 import { TabData } from '../types';
 import { useStore } from '../store';
 import { DBQuery } from '../../wailsjs/go/app/App';
 import { buildRpcConnectionConfig } from '../utils/connectionRpcConfig';
+import { normalizeOceanBaseProtocol } from '../utils/oceanBaseProtocol';
+import { splitQualifiedNameLast } from '../utils/qualifiedName';
+import { buildEditableTriggerSql } from '../utils/triggerEditSql';
+import { buildSqlServerObjectDefinitionQueries } from '../utils/sqlServerObjectDefinition';
+import { useI18n } from '../i18n/provider';
 
 interface TriggerViewerProps {
     tab: TabData;
 }
 
+const getCaseInsensitiveRawValue = (row: Record<string, any>, keys: string[]): any => {
+    const normalizedKeyMap = new Map<string, string>();
+    Object.keys(row || {}).forEach((key) => normalizedKeyMap.set(key.toLowerCase(), key));
+    for (const key of keys) {
+        const matchedKey = normalizedKeyMap.get(String(key || '').toLowerCase());
+        if (!matchedKey) continue;
+        const value = row[matchedKey];
+        if (value !== undefined && value !== null && String(value).trim() !== '') {
+            return value;
+        }
+    }
+    return undefined;
+};
+
+const buildMySQLTriggerDDLFromMetadata = (
+    row: Record<string, any>,
+    fallbackTriggerName: string,
+    fallbackTableName: string,
+): string => {
+    const triggerName = String(
+        getCaseInsensitiveRawValue(row, ['trigger_name', 'Trigger', 'TRIGGER_NAME'])
+        || splitQualifiedNameLast(fallbackTriggerName).objectName
+        || fallbackTriggerName,
+    ).trim();
+    const triggerSchema = String(getCaseInsensitiveRawValue(row, ['trigger_schema', 'TRIGGER_SCHEMA']) || '').trim();
+    const eventSchema = String(getCaseInsensitiveRawValue(row, ['event_object_schema', 'EVENT_OBJECT_SCHEMA']) || '').trim();
+    const eventTable = String(
+        getCaseInsensitiveRawValue(row, ['event_object_table', 'EVENT_OBJECT_TABLE', 'table_name', 'TABLE_NAME'])
+        || splitQualifiedNameLast(fallbackTableName).objectName
+        || fallbackTableName,
+    ).trim();
+    const actionTiming = String(getCaseInsensitiveRawValue(row, ['action_timing', 'ACTION_TIMING']) || '').trim().toUpperCase();
+    const eventManipulation = String(getCaseInsensitiveRawValue(row, ['event_manipulation', 'EVENT_MANIPULATION']) || '').trim().toUpperCase();
+    const actionOrientation = String(getCaseInsensitiveRawValue(row, ['action_orientation', 'ACTION_ORIENTATION']) || '').trim().toUpperCase();
+    const actionStatement = String(getCaseInsensitiveRawValue(row, ['action_statement', 'ACTION_STATEMENT']) || '').trim();
+
+    if (!triggerName || !eventTable || !actionTiming || !eventManipulation || !actionStatement) {
+        return '';
+    }
+
+    const qualifiedTriggerName = triggerSchema ? `\`${triggerSchema.replace(/`/g, '``')}\`.\`${triggerName.replace(/`/g, '``')}\`` : `\`${triggerName.replace(/`/g, '``')}\``;
+    const qualifiedTableName = eventSchema ? `\`${eventSchema.replace(/`/g, '``')}\`.\`${eventTable.replace(/`/g, '``')}\`` : `\`${eventTable.replace(/`/g, '``')}\``;
+    const orientationClause = actionOrientation === 'ROW' ? '\nFOR EACH ROW' : '';
+    return `CREATE TRIGGER ${qualifiedTriggerName}\n${actionTiming} ${eventManipulation} ON ${qualifiedTableName}${orientationClause}\n${actionStatement}`;
+};
+
+const buildOracleLikeTriggerDDLFromMetadata = (
+    row: Record<string, any>,
+    fallbackTriggerName: string,
+    fallbackTableName: string,
+): string => {
+    const triggerName = String(
+        getCaseInsensitiveRawValue(row, ['trigger_name', 'TRIGGER_NAME'])
+        || splitQualifiedNameLast(fallbackTriggerName).objectName
+        || fallbackTriggerName,
+    ).trim();
+    const owner = String(getCaseInsensitiveRawValue(row, ['owner', 'OWNER']) || splitQualifiedNameLast(fallbackTriggerName).parentPath || '').trim();
+    const tableOwner = String(getCaseInsensitiveRawValue(row, ['table_owner', 'TABLE_OWNER']) || splitQualifiedNameLast(fallbackTableName).parentPath || '').trim();
+    const tableName = String(
+        getCaseInsensitiveRawValue(row, ['table_name', 'TABLE_NAME'])
+        || splitQualifiedNameLast(fallbackTableName).objectName
+        || fallbackTableName,
+    ).trim();
+    const triggerType = String(getCaseInsensitiveRawValue(row, ['trigger_type', 'TRIGGER_TYPE']) || '').trim();
+    const triggeringEvent = String(getCaseInsensitiveRawValue(row, ['triggering_event', 'TRIGGERING_EVENT']) || '').trim();
+    const whenClause = String(getCaseInsensitiveRawValue(row, ['when_clause', 'WHEN_CLAUSE']) || '').trim();
+    const triggerBody = String(getCaseInsensitiveRawValue(row, ['trigger_body', 'TRIGGER_BODY']) || '').trim();
+
+    if (!triggerName || !tableName || !triggerType || !triggeringEvent || !triggerBody) {
+        return '';
+    }
+
+    const qualifiedTriggerName = owner ? `${owner}.${triggerName}` : triggerName;
+    const qualifiedTableName = tableOwner ? `${tableOwner}.${tableName}` : tableName;
+    const normalizedWhenClause = whenClause ? `\nWHEN (${whenClause.replace(/^\((.*)\)$/s, '$1')})` : '';
+    const normalizedTriggerType = triggerType.replace(/\s+/g, ' ').trim();
+    const triggerTypeMatch = normalizedTriggerType.match(/^(BEFORE|AFTER|INSTEAD OF)(?:\s+(EACH ROW|STATEMENT))?$/i);
+    if (triggerTypeMatch) {
+        const timing = String(triggerTypeMatch[1] || '').toUpperCase();
+        const firingLevel = String(triggerTypeMatch[2] || '').toUpperCase();
+        const forEachRowClause = firingLevel === 'EACH ROW' ? '\nFOR EACH ROW' : '';
+        return `CREATE OR REPLACE TRIGGER ${qualifiedTriggerName}\n${timing} ${triggeringEvent} ON ${qualifiedTableName}${forEachRowClause}${normalizedWhenClause}\n${triggerBody}`;
+    }
+    return `CREATE OR REPLACE TRIGGER ${qualifiedTriggerName}\n${triggerType} ${triggeringEvent} ON ${qualifiedTableName}${normalizedWhenClause}\n${triggerBody}`;
+};
+
 const TriggerViewer: React.FC<TriggerViewerProps> = ({ tab }) => {
+    const { t } = useI18n();
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const [triggerDefinition, setTriggerDefinition] = useState<string>('');
+    const [openingObjectEdit, setOpeningObjectEdit] = useState(false);
+    const isMountedRef = useRef(true);
+    const loadedDefinitionKeyRef = useRef('');
 
     const connections = useStore(state => state.connections);
     const theme = useStore(state => state.theme);
+    const addTab = useStore(state => state.addTab);
+    const setActiveContext = useStore(state => state.setActiveContext);
     const darkMode = theme === 'dark';
+    const objectIdentityKey = [
+        tab.connectionId,
+        tab.dbName,
+        tab.type,
+        tab.triggerName,
+        tab.triggerTableName,
+        tab.schemaName,
+    ].map((item) => String(item || '')).join('||');
 
-    // 透明 Monaco Editor 主题已在 main.tsx 全局注册（含 stickyScroll 不透明背景）
+    // 透明 Monaco Editor 主题由 MonacoEditor 包装组件按需注册（含 stickyScroll 不透明背景）
 
     const escapeSQLLiteral = (raw: string): string => String(raw || '').replace(/'/g, "''");
-    const quoteSqlServerIdentifier = (raw: string): string => `[${String(raw || '').replace(/]/g, ']]')}]`;
+    const parseSchemaAndName = (fullName: string): { schema: string; name: string } => {
+        const parsed = splitQualifiedNameLast(fullName);
+        return { schema: parsed.parentPath, name: parsed.objectName };
+    };
 
     const getMetadataDialect = (conn: any): string => {
         const type = String(conn?.config?.type || '').trim().toLowerCase();
         if (type === 'custom') {
             const driver = String(conn?.config?.driver || '').trim().toLowerCase();
             if (driver === 'diros' || driver === 'doris') return 'mysql';
+            if (driver === 'goldendb' || driver === 'greatdb' || driver === 'gdb') return 'mysql';
+            if (driver === 'oceanbase') return normalizeOceanBaseProtocol(conn?.config?.oceanBaseProtocol) === 'oracle' ? 'oracle' : 'mysql';
+            if (driver === 'opengauss' || driver === 'open_gauss' || driver === 'open-gauss') return 'opengauss';
+            if (driver === 'gaussdb' || driver === 'gauss_db' || driver === 'gauss-db') return 'gaussdb';
             return driver;
         }
-        if (type === 'mariadb' || type === 'diros' || type === 'sphinx') return 'mysql';
+        if (type === 'oceanbase' && normalizeOceanBaseProtocol(conn?.config?.oceanBaseProtocol) === 'oracle') return 'oracle';
+        if (type === 'goldendb' || type === 'mariadb' || type === 'oceanbase' || type === 'diros' || type === 'sphinx') return 'mysql';
         if (type === 'dameng') return 'dm';
         return type;
     };
@@ -44,15 +158,19 @@ const TriggerViewer: React.FC<TriggerViewerProps> = ({ tab }) => {
         return driver === 'sphinx' || driver === 'sphinxql';
     };
 
+    const commentLine = (key: string, params?: Record<string, any>): string => `-- ${t(key, params)}`;
+
     const buildShowTriggerQueries = (dialect: string, triggerName: string, dbName: string): string[] => {
-        const safeTriggerName = escapeSQLLiteral(triggerName);
+        const { schema, name } = parseSchemaAndName(triggerName);
+        const safeTriggerName = escapeSQLLiteral(name);
         const safeDbName = escapeSQLLiteral(dbName);
         switch (dialect) {
             case 'mysql':
+            case 'starrocks':
                 return [
-                    `SHOW CREATE TRIGGER \`${triggerName.replace(/`/g, '``')}\``,
+                    `SHOW CREATE TRIGGER \`${name.replace(/`/g, '``')}\``,
                     safeDbName
-                        ? `SELECT ACTION_STATEMENT AS trigger_definition FROM information_schema.triggers WHERE trigger_schema = '${safeDbName}' AND trigger_name = '${safeTriggerName}' LIMIT 1`
+                        ? `SELECT TRIGGER_NAME, TRIGGER_SCHEMA, EVENT_OBJECT_SCHEMA, EVENT_OBJECT_TABLE, ACTION_TIMING, EVENT_MANIPULATION, ACTION_ORIENTATION, ACTION_STATEMENT FROM information_schema.triggers WHERE trigger_schema = '${safeDbName}' AND trigger_name = '${safeTriggerName}' LIMIT 1`
                         : '',
                     safeDbName
                         ? `SHOW TRIGGERS FROM \`${dbName.replace(/`/g, '``')}\` LIKE '${safeTriggerName}'`
@@ -62,6 +180,8 @@ const TriggerViewer: React.FC<TriggerViewerProps> = ({ tab }) => {
             case 'kingbase':
             case 'highgo':
             case 'vastbase':
+            case 'opengauss':
+            case 'gaussdb':
                 return [`SELECT pg_get_triggerdef(t.oid, true) AS trigger_definition
 FROM pg_trigger t
 JOIN pg_class c ON t.tgrelid = c.oid
@@ -69,24 +189,36 @@ WHERE t.tgname = '${safeTriggerName}'
   AND NOT t.tgisinternal
 LIMIT 1`];
             case 'sqlserver': {
-                return [`SELECT OBJECT_DEFINITION(OBJECT_ID('${safeTriggerName.replace(/'/g, "''")}')) AS trigger_definition`];
+                return buildSqlServerObjectDefinitionQueries('trigger', triggerName, dbName, 'trigger_definition');
             }
             case 'oracle':
             case 'dm':
-                if (!safeDbName) {
-                    return [`SELECT TRIGGER_BODY FROM USER_TRIGGERS WHERE TRIGGER_NAME = '${safeTriggerName.toUpperCase()}'`];
+                if (schema) {
+                    return [
+                        `SELECT DBMS_METADATA.GET_DDL('TRIGGER', '${safeTriggerName.toUpperCase()}', '${escapeSQLLiteral(schema).toUpperCase()}') AS trigger_definition FROM DUAL`,
+                        `SELECT OWNER, TABLE_OWNER, TABLE_NAME, TRIGGER_NAME, TRIGGER_TYPE, TRIGGERING_EVENT, WHEN_CLAUSE, TRIGGER_BODY FROM ALL_TRIGGERS WHERE OWNER = '${escapeSQLLiteral(schema).toUpperCase()}' AND TRIGGER_NAME = '${safeTriggerName.toUpperCase()}'`,
+                    ];
                 }
-                return [`SELECT TRIGGER_BODY FROM ALL_TRIGGERS WHERE OWNER = '${safeDbName.toUpperCase()}' AND TRIGGER_NAME = '${safeTriggerName.toUpperCase()}'`];
+                if (!safeDbName) {
+                    return [
+                        `SELECT DBMS_METADATA.GET_DDL('TRIGGER', '${safeTriggerName.toUpperCase()}') AS trigger_definition FROM DUAL`,
+                        `SELECT TABLE_NAME, TRIGGER_NAME, TRIGGER_TYPE, TRIGGERING_EVENT, WHEN_CLAUSE, TRIGGER_BODY FROM USER_TRIGGERS WHERE TRIGGER_NAME = '${safeTriggerName.toUpperCase()}'`,
+                    ];
+                }
+                return [
+                    `SELECT DBMS_METADATA.GET_DDL('TRIGGER', '${safeTriggerName.toUpperCase()}', '${safeDbName.toUpperCase()}') AS trigger_definition FROM DUAL`,
+                    `SELECT OWNER, TABLE_OWNER, TABLE_NAME, TRIGGER_NAME, TRIGGER_TYPE, TRIGGERING_EVENT, WHEN_CLAUSE, TRIGGER_BODY FROM ALL_TRIGGERS WHERE OWNER = '${safeDbName.toUpperCase()}' AND TRIGGER_NAME = '${safeTriggerName.toUpperCase()}'`,
+                ];
             case 'sqlite':
                 return [`SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = '${safeTriggerName}'`];
             case 'duckdb':
-                return [`-- DuckDB 不支持触发器`];
+                return [commentLine('trigger_viewer.editor.unsupported.duckdb')];
             case 'tdengine':
-                return [`-- TDengine 不支持触发器`];
+                return [commentLine('trigger_viewer.editor.unsupported.tdengine')];
             case 'mongodb':
-                return [`-- MongoDB 不支持触发器`];
+                return [commentLine('trigger_viewer.editor.unsupported.mongodb')];
             default:
-                return [`-- 暂不支持该数据库类型的触发器定义查看`];
+                return [commentLine('trigger_viewer.editor.unsupported.generic')];
         }
     };
 
@@ -148,19 +280,24 @@ LIMIT 1`];
         return '';
     };
 
-    const extractTriggerDefinition = (dialect: string, data: any[]): string => {
+    const extractTriggerDefinition = (dialect: string, data: any[], fallbackTriggerName: string, fallbackTableName: string): string => {
         if (!data || data.length === 0) {
-            return '-- 未找到触发器定义';
+            return commentLine('trigger_viewer.editor.definition_not_found');
         }
 
-        const row = data[0];
+        const row = data[0] as Record<string, any>;
 
         switch (dialect) {
-            case 'mysql': {
+            case 'mysql':
+            case 'starrocks': {
                 // MySQL SHOW CREATE TRIGGER returns: Trigger, sql_mode, SQL Original Statement, ...
                 const keys = Object.keys(row);
+                const metadataDDL = buildMySQLTriggerDDLFromMetadata(row, fallbackTriggerName, fallbackTableName);
                 if (row.trigger_definition || row.TRIGGER_DEFINITION) {
                     return String(row.trigger_definition || row.TRIGGER_DEFINITION);
+                }
+                if (metadataDDL) {
+                    return metadataDDL;
                 }
                 if (row.ACTION_STATEMENT || row.action_statement) {
                     return String(row.ACTION_STATEMENT || row.action_statement);
@@ -179,14 +316,34 @@ LIMIT 1`];
             case 'postgres':
             case 'kingbase':
             case 'highgo':
-            case 'vastbase': {
+            case 'vastbase':
+            case 'opengauss':
+            case 'gaussdb': {
                 return row.trigger_definition || row.TRIGGER_DEFINITION || Object.values(row)[0] || '';
             }
             case 'sqlserver': {
-                return row.trigger_definition || row.TRIGGER_DEFINITION || Object.values(row)[0] || '';
+                const directDefinition = getCaseInsensitiveRawValue(row, ['trigger_definition', 'definition']);
+                if (directDefinition !== undefined && directDefinition !== null && String(directDefinition).trim() !== '') {
+                    return String(directDefinition);
+                }
+                const helpTextDefinition = data
+                    .map((item) => getCaseInsensitiveRawValue(item, ['Text', 'text']))
+                    .filter((value) => value !== undefined && value !== null)
+                    .map((value) => String(value))
+                    .join('');
+                if (helpTextDefinition.trim()) return helpTextDefinition;
+                return Object.values(row)[0] || '';
             }
             case 'oracle':
             case 'dm': {
+                const ddl = String(row.trigger_definition || row.TRIGGER_DEFINITION || '').trim();
+                if (ddl) {
+                    return ddl;
+                }
+                const metadataDDL = buildOracleLikeTriggerDDLFromMetadata(row, fallbackTriggerName, fallbackTableName);
+                if (metadataDDL) {
+                    return metadataDDL;
+                }
                 return row.trigger_body || row.TRIGGER_BODY || Object.values(row)[0] || '';
             }
             case 'sqlite': {
@@ -197,108 +354,193 @@ LIMIT 1`];
         }
     };
 
+    const loadTriggerDefinition = async (): Promise<{ success: boolean; definition?: string; error?: string }> => {
+        const conn = connections.find(c => c.id === tab.connectionId);
+        if (!conn) {
+            return { success: false, error: t('trigger_viewer.error.connection_not_found') };
+        }
+
+        const triggerName = tab.triggerName || '';
+        const dbName = tab.dbName || '';
+
+        if (!triggerName) {
+            return { success: false, error: t('trigger_viewer.error.trigger_name_empty') };
+        }
+
+        const dialect = getMetadataDialect(conn);
+        const queries = buildShowTriggerQueries(dialect, triggerName, dbName);
+        const sphinxLike = isSphinxConnection(conn) && dialect === 'mysql';
+
+        if (!queries.length || String(queries[0] || '').startsWith('--')) {
+            return { success: true, definition: String(queries[0] || commentLine('trigger_viewer.editor.unsupported.generic')) };
+        }
+
+        try {
+            const config = {
+                ...conn.config,
+                port: Number(conn.config.port),
+                password: conn.config.password || '',
+                database: conn.config.database || '',
+                useSSH: conn.config.useSSH || false,
+                ssh: conn.config.ssh || { host: '', port: 22, user: '', password: '', keyPath: '' }
+            };
+
+            const result = await runQueryCandidates(config, dbName, queries);
+
+            if (result.success && Array.isArray(result.data) && result.data.length > 0) {
+                return {
+                    success: true,
+                    definition: extractTriggerDefinition(dialect, result.data, triggerName, String(tab.triggerTableName || '')),
+                };
+            }
+
+            if (result.success) {
+                if (sphinxLike) {
+                    const version = await getVersionHint(config, dbName);
+                    const versionText = version ? t('trigger_viewer.editor.sphinx.version_suffix', { version }) : '';
+                    return {
+                        success: true,
+                        definition: [
+                            commentLine('trigger_viewer.editor.sphinx.empty_result', { version: versionText }),
+                            commentLine('trigger_viewer.editor.sphinx.compat_queries_hint'),
+                        ].join('\n'),
+                    };
+                }
+                return { success: true, definition: commentLine('trigger_viewer.editor.definition_not_found') };
+            }
+
+            if (sphinxLike) {
+                const version = await getVersionHint(config, dbName);
+                const versionText = version ? t('trigger_viewer.editor.sphinx.version_suffix', { version }) : '';
+                const failedMessage = result.message
+                    ? `${t('trigger_viewer.editor.sphinx.failed_message_label')}: ${result.message}`
+                    : t('trigger_viewer.editor.sphinx.failed_message_unknown');
+                return {
+                    success: true,
+                    definition: [
+                        commentLine('trigger_viewer.editor.sphinx.unsupported_query', { version: versionText }),
+                        commentLine('trigger_viewer.editor.sphinx.compat_queries_hint'),
+                        `-- ${failedMessage}`,
+                    ].join('\n'),
+                };
+            }
+
+            return {
+                success: false,
+                error: result.message
+                    ? t('trigger_viewer.error.query_failed_detail', { detail: result.message })
+                    : t('trigger_viewer.error.query_failed'),
+            };
+        } catch (e: any) {
+            return { success: false, error: t('trigger_viewer.error.query_failed_detail', { detail: e?.message || String(e) }) };
+        }
+    };
+
     useEffect(() => {
-        const loadTriggerDefinition = async () => {
+        let cancelled = false;
+        const syncTriggerDefinition = async () => {
             setLoading(true);
             setError(null);
-
-            const conn = connections.find(c => c.id === tab.connectionId);
-            if (!conn) {
-                setError('未找到数据库连接');
-                setLoading(false);
+            const result = await loadTriggerDefinition();
+            if (cancelled) {
                 return;
             }
-
-            const triggerName = tab.triggerName || '';
-            const dbName = tab.dbName || '';
-
-            if (!triggerName) {
-                setError('触发器名称为空');
-                setLoading(false);
-                return;
+            if (result.success) {
+                loadedDefinitionKeyRef.current = objectIdentityKey;
+                setTriggerDefinition(String(result.definition || ''));
+            } else {
+                setError(result.error || t('trigger_viewer.error.query_failed'));
             }
-
-            const dialect = getMetadataDialect(conn);
-            const queries = buildShowTriggerQueries(dialect, triggerName, dbName);
-            const sphinxLike = isSphinxConnection(conn) && dialect === 'mysql';
-
-            if (!queries.length || String(queries[0] || '').startsWith('--')) {
-                setTriggerDefinition(String(queries[0] || '-- 暂不支持该数据库类型的触发器定义查看'));
-                setLoading(false);
-                return;
-            }
-
-            try {
-                const config = {
-                    ...conn.config,
-                    port: Number(conn.config.port),
-                    password: conn.config.password || '',
-                    database: conn.config.database || '',
-                    useSSH: conn.config.useSSH || false,
-                    ssh: conn.config.ssh || { host: '', port: 22, user: '', password: '', keyPath: '' }
-                };
-
-                const result = await runQueryCandidates(config, dbName, queries);
-
-                if (result.success && Array.isArray(result.data) && result.data.length > 0) {
-                    const definition = extractTriggerDefinition(dialect, result.data);
-                    setTriggerDefinition(definition);
-                    return;
-                }
-
-                if (result.success) {
-                    if (sphinxLike) {
-                        const version = await getVersionHint(config, dbName);
-                        const versionText = version ? `（版本: ${version}）` : '';
-                        setTriggerDefinition(`-- 当前 Sphinx 实例${versionText}未返回触发器定义。\n-- 已执行多套兼容查询，可能是版本能力限制或对象类型不支持。`);
-                        return;
-                    }
-                    setTriggerDefinition('-- 未找到触发器定义');
-                } else if (sphinxLike) {
-                    const version = await getVersionHint(config, dbName);
-                    const versionText = version ? `（版本: ${version}）` : '';
-                    setTriggerDefinition(`-- 当前 Sphinx 实例${versionText}不支持触发器定义查询。\n-- 已自动尝试兼容语句，返回失败信息: ${result.message || 'unknown error'}`);
-                } else {
-                    setError(result.message || '查询触发器定义失败');
-                }
-            } catch (e: any) {
-                setError('查询触发器定义失败: ' + (e?.message || String(e)));
-            } finally {
-                setLoading(false);
-            }
+            setLoading(false);
         };
 
-        loadTriggerDefinition();
-    }, [tab.connectionId, tab.dbName, tab.triggerName, connections]);
+        syncTriggerDefinition();
+
+        return () => {
+            cancelled = true;
+        };
+    }, [tab.connectionId, tab.dbName, tab.triggerName, connections, objectIdentityKey, t]);
+
+    useEffect(() => () => {
+        isMountedRef.current = false;
+    }, []);
 
     if (loading) {
         return (
             <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100%' }}>
-                <Spin tip="加载触发器定义..." />
+                <Spin tip={t('trigger_viewer.loading.definition')} />
             </div>
         );
     }
 
-    if (error) {
+    const displayedDefinition = loadedDefinitionKeyRef.current === objectIdentityKey ? triggerDefinition : '';
+    const hasDefinition = String(displayedDefinition || '').trim() !== '';
+
+    if (error && !hasDefinition) {
         return (
             <div style={{ padding: 16 }}>
-                <Alert type="error" message="加载失败" description={error} showIcon />
+                <Alert type="error" message={t('trigger_viewer.error.load_failed')} description={error} showIcon />
             </div>
         );
     }
+
+    const triggerName = String(tab.triggerName || '').trim();
+    const dbName = String(tab.dbName || '').trim();
+    const openObjectEditQuery = async () => {
+        if (!triggerName || openingObjectEdit) return;
+        setOpeningObjectEdit(true);
+        setError(null);
+        try {
+            const result = await loadTriggerDefinition();
+            if (!isMountedRef.current) {
+                return;
+            }
+            if (!result.success) {
+                setError(result.error || t('trigger_viewer.error.query_failed'));
+                return;
+            }
+            const latestDefinition = String(result.definition || '');
+            loadedDefinitionKeyRef.current = objectIdentityKey;
+            setTriggerDefinition(latestDefinition);
+            setActiveContext({ connectionId: tab.connectionId, dbName });
+            addTab({
+                id: `query-edit-trigger-${tab.connectionId}-${dbName}-${Date.now()}`,
+                title: t('trigger_viewer.tab.edit_trigger_title', { name: triggerName }),
+                type: 'query',
+                connectionId: tab.connectionId,
+                dbName,
+                query: buildEditableTriggerSql(triggerName, latestDefinition, { translate: t }),
+                queryMode: 'object-edit',
+            });
+        } finally {
+            if (isMountedRef.current) {
+                setOpeningObjectEdit(false);
+            }
+        }
+    };
 
     return (
         <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-            <div style={{ padding: '8px 16px', borderBottom: darkMode ? '1px solid #303030' : '1px solid #f0f0f0' }}>
-                <strong>触发器: </strong>{tab.triggerName}
-                {tab.dbName && <span style={{ marginLeft: 16, color: '#888' }}>数据库: {tab.dbName}</span>}
+            <div style={{ padding: '8px 16px', borderBottom: darkMode ? '1px solid #303030' : '1px solid #f0f0f0', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+                <div style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    <strong>{t('trigger_viewer.field.trigger')}: </strong>{tab.triggerName}
+                    {tab.dbName && <span style={{ marginLeft: 16, color: '#888' }}>{t('trigger_viewer.field.database')}: {tab.dbName}</span>}
+                </div>
+                <Button size="small" icon={<EditOutlined />} onClick={openObjectEditQuery} disabled={!triggerName} loading={openingObjectEdit}>
+                    {t('trigger_viewer.action.edit_object')}
+                </Button>
             </div>
+            {error && hasDefinition && (
+                <div style={{ padding: '8px 16px 0' }}>
+                    <Alert type="warning" message={t('trigger_viewer.warning.refresh_latest_failed')} description={error} showIcon />
+                </div>
+            )}
             <div style={{ flex: 1, minHeight: 0 }}>
                 <Editor
                     height="100%"
                     language="sql"
                     theme={darkMode ? 'transparent-dark' : 'transparent-light'}
-                    value={triggerDefinition}
+                    value={displayedDefinition}
                     options={{
                         readOnly: true,
                         minimap: { enabled: false },

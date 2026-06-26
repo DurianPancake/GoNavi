@@ -1,9 +1,18 @@
-import React, { useState, useCallback, useRef, useEffect } from 'react';
+import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import { Button, Space, message } from 'antd';
 import { PlayCircleOutlined, ClearOutlined } from '@ant-design/icons';
 import { useStore } from '../store';
 import { buildRpcConnectionConfig } from '../utils/connectionRpcConfig';
-import Editor, { OnMount } from '@monaco-editor/react';
+import { t, type I18nParams } from '../i18n';
+import { useOptionalI18n } from '../i18n/provider';
+import Editor, { type OnMount } from './MonacoEditor';
+import {
+    isMacLikePlatform,
+    normalizeBlurForPlatform,
+    normalizeOpacityForPlatform,
+    resolveAppearanceValues,
+} from '../utils/appearance';
+import { buildRedisWorkbenchTheme } from './redisViewerWorkbenchTheme';
 
 interface RedisCommandEditorProps {
     connectionId: string;
@@ -17,6 +26,26 @@ interface CommandResult {
     timestamp: number;
     durationMs: number;
 }
+
+export const REDIS_COMMAND_EDITOR_MIN_HEIGHT = 120;
+export const REDIS_COMMAND_OUTPUT_MIN_HEIGHT = 240;
+export const REDIS_COMMAND_RESIZER_HEIGHT = 8;
+
+export const clampRedisCommandEditorHeight = (
+    requestedHeight: number,
+    containerHeight: number | undefined,
+): number => {
+    const minHeight = REDIS_COMMAND_EDITOR_MIN_HEIGHT;
+    const fallbackMaxHeight = 800;
+    const maxHeight = containerHeight
+        ? Math.max(
+            minHeight,
+            containerHeight - REDIS_COMMAND_OUTPUT_MIN_HEIGHT - REDIS_COMMAND_RESIZER_HEIGHT,
+        )
+        : fallbackMaxHeight;
+
+    return Math.min(Math.max(requestedHeight, minHeight), maxHeight);
+};
 
 // 智能解析 Redis 脚本块，保护多行引号内的换行符
 function parseRedisScriptBlocks(script: string): string[] {
@@ -79,8 +108,23 @@ function parseRedisScriptBlocks(script: string): string[] {
 }
 
 const RedisCommandEditor: React.FC<RedisCommandEditorProps> = ({ connectionId, redisDB }) => {
-    const { connections } = useStore();
+    const connections = useStore(state => state.connections);
+    const theme = useStore(state => state.theme);
+    const appearance = useStore(state => state.appearance);
+    const i18n = useOptionalI18n();
+    const i18nLanguage = i18n?.language;
+    const tr = (key: string, params?: I18nParams) => t(key, params, i18nLanguage);
     const connection = connections.find(c => c.id === connectionId);
+    const darkMode = theme === 'dark';
+    const isV2Ui = appearance.uiVersion === 'v2';
+    const resolvedAppearance = resolveAppearanceValues(appearance);
+    const opacity = normalizeOpacityForPlatform(resolvedAppearance.opacity);
+    const blur = normalizeBlurForPlatform(resolvedAppearance.blur);
+    const disableLocalBackdropFilter = isMacLikePlatform();
+    const workbenchTheme = useMemo(
+        () => buildRedisWorkbenchTheme({ darkMode, opacity, blur, disableBackdropFilter: disableLocalBackdropFilter }),
+        [blur, darkMode, disableLocalBackdropFilter, opacity, appearance.uiVersion],
+    );
 
     const [command, setCommand] = useState('');
     const [results, setResults] = useState<CommandResult[]>([]);
@@ -163,7 +207,7 @@ const RedisCommandEditor: React.FC<RedisCommandEditorProps> = ({ connectionId, r
                             kind: monaco.languages.CompletionItemKind.Keyword,
                             insertText: cmd,
                             range: range,
-                            detail: "Redis Command"
+                            detail: tr('redis_command.completion.detail')
                         }))
                     };
                 }
@@ -188,7 +232,7 @@ const RedisCommandEditor: React.FC<RedisCommandEditorProps> = ({ connectionId, r
 
         cmdToExecute = cmdToExecute.trim();
         if (!cmdToExecute) {
-            message.warning('请输入要执行的命令');
+            message.warning(tr('redis_command.message.command_required'));
             return;
         }
 
@@ -294,11 +338,11 @@ const RedisCommandEditor: React.FC<RedisCommandEditorProps> = ({ connectionId, r
         const delta = e.clientY - dragRef.current.startY;
         let newHeight = dragRef.current.startHeight + delta;
         
-        // 限制高度
-        const minHeight = 100;
-        const maxHeight = containerRef.current ? containerRef.current.clientHeight - 100 : 800;
-        if (newHeight < minHeight) newHeight = minHeight;
-        if (newHeight > maxHeight) newHeight = maxHeight;
+        // 限制输入区高度，避免拖拽后压缩掉底部输出区。
+        newHeight = clampRedisCommandEditorHeight(
+            newHeight,
+            containerRef.current?.clientHeight,
+        );
         
         setEditorHeight(newHeight);
         
@@ -319,17 +363,40 @@ const RedisCommandEditor: React.FC<RedisCommandEditorProps> = ({ connectionId, r
     }, [handleDragMove]);
 
     if (!connection) {
-        return <div style={{ padding: 20 }}>连接不存在</div>;
+        return <div style={{ padding: 20 }}>{tr('redis_command.state.connection_not_found')}</div>;
     }
 
     return (
-        <div ref={containerRef} style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden', background: '#fff' }}>
+        <div
+            ref={containerRef}
+            data-redis-command-editor="true"
+            style={{
+                display: 'flex',
+                flexDirection: 'column',
+                height: '100%',
+                overflow: 'hidden',
+                background: workbenchTheme.appBg,
+                color: workbenchTheme.textPrimary,
+                backdropFilter: workbenchTheme.backdropFilter,
+                WebkitBackdropFilter: workbenchTheme.backdropFilter,
+            }}
+        >
             {/* Editor Top Pane */}
-            <div style={{ height: editorHeight, minHeight: 100, display: 'flex', flexDirection: 'column' }}>
-                <div style={{ padding: '8px 12px', borderBottom: '1px solid #f0f0f0', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#fdfdfd' }}>
+            <div
+                data-redis-command-input-pane="true"
+                style={{
+                    height: editorHeight,
+                    minHeight: REDIS_COMMAND_EDITOR_MIN_HEIGHT,
+                    display: 'flex',
+                    flexDirection: 'column',
+                    background: workbenchTheme.panelBg,
+                    borderBottom: workbenchTheme.panelBorder,
+                }}
+            >
+                <div style={{ padding: '8px 12px', borderBottom: workbenchTheme.panelBorder, display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: workbenchTheme.panelBgStrong }}>
                     <Space>
-                        <span style={{ fontWeight: 600 }}>Redis Console</span>
-                        <span style={{ color: '#888', fontSize: 13, background: '#f0f0f0', padding: '2px 8px', borderRadius: 12 }}>db{redisDB}</span>
+                        <span style={{ fontWeight: 600, color: workbenchTheme.textPrimary }}>{tr('redis_command.title.console')}</span>
+                        <span style={{ color: workbenchTheme.textSecondary, fontSize: 13, background: workbenchTheme.statusTagMutedBg, border: workbenchTheme.statusTagMutedBorder, padding: '2px 8px', borderRadius: 12 }}>db{redisDB}</span>
                     </Space>
                     <Space>
                         <Button
@@ -338,12 +405,14 @@ const RedisCommandEditor: React.FC<RedisCommandEditorProps> = ({ connectionId, r
                             onClick={handleExecute}
                             loading={loading}
                         >
-                            执行 (Cmd+Enter)
+                            {tr('redis_command.action.execute')}
                         </Button>
                     </Space>
                 </div>
-                <div style={{ flex: 1, position: 'relative' }}>
+                <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
                     <Editor
+                        theme={darkMode ? 'transparent-dark' : 'transparent-light'}
+                        gonaviTypography="code"
                         defaultLanguage="redis"
                         language="redis"
                         value={command}
@@ -352,7 +421,6 @@ const RedisCommandEditor: React.FC<RedisCommandEditorProps> = ({ connectionId, r
                         options={{
                             minimap: { enabled: false },
                             lineNumbers: 'on',
-                            fontSize: 14,
                             wordWrap: 'on',
                             scrollBeyondLastLine: false,
                             automaticLayout: true,
@@ -366,34 +434,58 @@ const RedisCommandEditor: React.FC<RedisCommandEditorProps> = ({ connectionId, r
             {/* Resizer Handle */}
             <div 
                 className="horizontal-resizer"
+                data-redis-command-resizer="true"
                 onMouseDown={handleDragStart}
                 style={{ 
-                    height: 8, 
+                    height: REDIS_COMMAND_RESIZER_HEIGHT,
                     cursor: 'row-resize', 
-                    background: '#f0f0f0', 
-                    borderTop: '1px solid #e0e0e0',
-                    borderBottom: '1px solid #e0e0e0',
+                    background: workbenchTheme.panelBgStrong,
+                    borderTop: workbenchTheme.panelBorder,
+                    borderBottom: workbenchTheme.panelBorder,
                     display: 'flex',
                     justifyContent: 'center',
                     alignItems: 'center',
                     zIndex: 10
                 }}
             >
-                <div style={{ width: 40, height: 4, background: '#ccc', borderRadius: 2 }} />
+                <div style={{ width: 40, height: 4, background: workbenchTheme.textMuted, borderRadius: 2, opacity: 0.6 }} />
             </div>
 
             {/* Results Terminal Bottom Pane */}
-            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-                 <div style={{ padding: '4px 12px', background: '#252526', display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid #333' }}>
-                    <span style={{ color: '#ccc', fontSize: 12 }}>Execution Output</span>
-                    <Button type="text" size="small" icon={<ClearOutlined />} onClick={handleClear} style={{ color: '#aaa' }}>清空控制台</Button>
+            <div
+                data-redis-command-output-pane="true"
+                style={{
+                    flex: 1,
+                    minHeight: REDIS_COMMAND_OUTPUT_MIN_HEIGHT,
+                    display: 'flex',
+                    flexDirection: 'column',
+                    overflow: 'hidden',
+                    background: darkMode ? '#111418' : workbenchTheme.panelBg,
+                }}
+            >
+                 <div style={{ padding: '4px 12px', background: darkMode ? '#1b1f27' : workbenchTheme.panelBgStrong, display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: workbenchTheme.panelBorder }}>
+                    <span style={{ color: workbenchTheme.textSecondary, fontSize: 12 }}>{tr('redis_command.output.title')}</span>
+                    <Button type="text" size="small" icon={<ClearOutlined />} onClick={handleClear} style={{ color: workbenchTheme.textSecondary }}>{tr('redis_command.action.clear_console')}</Button>
                 </div>
-                <div style={{ flex: 1, overflow: 'auto', background: '#1e1e1e', color: '#d4d4d4', fontFamily: '"Consolas", "Courier New", monospace', fontSize: 13, padding: 12 }}>
+                <div
+                    data-redis-command-output-terminal="true"
+                    style={{
+                        flex: 1,
+                        minHeight: 0,
+                        overflow: 'auto',
+                        background: darkMode ? '#111418' : '#f8fafc',
+                        color: darkMode ? '#d4d4d4' : '#0f172a',
+                        fontFamily: 'var(--gn-font-mono)',
+                        fontSize: 'var(--gn-font-size-mono, 13px)',
+                        lineHeight: '1.62',
+                        padding: 12,
+                    }}
+                >
                     {results.length === 0 ? (
-                        <div style={{ color: '#666', textAlign: 'center', marginTop: 40 }}>
-                            <div>在此终端执行命令，结果会以原样输出</div>
+                        <div style={{ color: workbenchTheme.textMuted, textAlign: 'center', marginTop: 40 }}>
+                            <div>{tr('redis_command.output.empty_hint')}</div>
                             <div style={{ fontSize: 12, marginTop: 12 }}>
-                                Tips: <code>选中任意行</code> 按 <code style={{ color: '#999' }}>Ctrl + Enter</code> 仅执行选中段落
+                                {tr('redis_command.output.selection_tip')}
                             </div>
                         </div>
                     ) : (
@@ -402,7 +494,7 @@ const RedisCommandEditor: React.FC<RedisCommandEditorProps> = ({ connectionId, r
                                 <div style={{ color: '#569cd6', marginBottom: 6, fontWeight: 'bold' }}>
                                     <span style={{ color: '#4CAF50', marginRight: 8 }}>➜</span>
                                     {item.command}
-                                    <span style={{ color: '#666', fontSize: 11, marginLeft: 12, fontWeight: 'normal' }}>[{item.durationMs}ms]</span>
+                                    <span style={{ color: workbenchTheme.textMuted, fontSize: 11, marginLeft: 12, fontWeight: 'normal' }}>[{item.durationMs}ms]</span>
                                 </div>
                                 
                                 <div style={{ paddingLeft: 20 }}>

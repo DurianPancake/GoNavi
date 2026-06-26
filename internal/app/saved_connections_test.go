@@ -1,6 +1,7 @@
 package app
 
 import (
+	"fmt"
 	"os"
 	"testing"
 
@@ -9,6 +10,8 @@ import (
 )
 
 func TestSplitConnectionSecretsStripsPasswordsAndOpaqueDSN(t *testing.T) {
+	withTestGOOS(t, "linux")
+
 	input := connection.SavedConnectionInput{
 		ID:   "conn-1",
 		Name: "Primary",
@@ -36,6 +39,36 @@ func TestSplitConnectionSecretsStripsPasswordsAndOpaqueDSN(t *testing.T) {
 	}
 	if !view.HasOpaqueDSN {
 		t.Fatal("expected view to report opaque DSN")
+	}
+}
+
+func TestSplitConnectionSecretsStripsRedisSentinelPassword(t *testing.T) {
+	withTestGOOS(t, "linux")
+
+	input := connection.SavedConnectionInput{
+		ID:   "redis-sentinel",
+		Name: "Redis Sentinel",
+		Config: connection.ConnectionConfig{
+			ID:                    "redis-sentinel",
+			Type:                  "redis",
+			Host:                  "sentinel.local",
+			Port:                  26379,
+			Topology:              "sentinel",
+			RedisSentinelMaster:   "mymaster",
+			RedisSentinelUser:     "sentinel-user",
+			RedisSentinelPassword: "sentinel-secret",
+		},
+	}
+
+	view, bundle := splitConnectionSecrets(input)
+	if view.Config.RedisSentinelPassword != "" {
+		t.Fatal("metadata must not keep Redis Sentinel password")
+	}
+	if bundle.RedisSentinelPassword != "sentinel-secret" {
+		t.Fatalf("bundle should keep Redis Sentinel password, got %q", bundle.RedisSentinelPassword)
+	}
+	if !view.HasRedisSentinelPassword {
+		t.Fatal("expected view to report Redis Sentinel password")
 	}
 }
 
@@ -70,3 +103,23 @@ func (s *fakeAppSecretStore) HealthCheck() error {
 }
 
 var _ secretstore.SecretStore = (*fakeAppSecretStore)(nil)
+
+type failOnUseSecretStore struct{}
+
+func (s failOnUseSecretStore) Put(string, []byte) error {
+	return fmt.Errorf("secret store should not be used")
+}
+
+func (s failOnUseSecretStore) Get(string) ([]byte, error) {
+	return nil, fmt.Errorf("secret store should not be used")
+}
+
+func (s failOnUseSecretStore) Delete(string) error {
+	return fmt.Errorf("secret store should not be used")
+}
+
+func (s failOnUseSecretStore) HealthCheck() error {
+	return fmt.Errorf("secret store should not be used")
+}
+
+var _ secretstore.SecretStore = (*failOnUseSecretStore)(nil)

@@ -46,6 +46,38 @@ describe('buildCopyInsertSQL', () => {
     );
   });
 
+  it('preserves fractional seconds for MySQL datetime precision columns', () => {
+    const sql = buildCopyInsertSQL({
+      dbType: 'mysql',
+      tableName: 'events',
+      orderedCols: ['created_at'],
+      record: {
+        created_at: '2026-05-10T09:12:33.456+08:00',
+      },
+      columnTypesByLowerName: {
+        created_at: 'datetime(3)',
+      },
+    });
+
+    expect(sql).toBe(
+      "INSERT INTO `events` (`created_at`) VALUES ('2026-05-10 09:12:33.456');",
+    );
+  });
+
+  it('uses ordered columns for copy-as-insert output', () => {
+    const sql = buildCopyInsertSQL({
+      dbType: 'mysql',
+      tableName: 'users',
+      orderedCols: ['name', 'id'],
+      record: {
+        id: 7,
+        name: 'Ada',
+      },
+    });
+
+    expect(sql).toBe("INSERT INTO `users` (`name`, `id`) VALUES ('Ada', '7');");
+  });
+
   it('keeps RFC3339-looking text unchanged for non-temporal columns', () => {
     const sql = buildCopyInsertSQL({
       dbType: 'postgres',
@@ -73,6 +105,20 @@ describe('buildCopyInsertSQL', () => {
     ])).toEqual([
       ['id'],
       ['tenant_id', 'code'],
+    ]);
+  });
+
+  it('accepts non-MySQL index metadata aliases when resolving safe unique locators', () => {
+    expect(resolveUniqueKeyGroupsFromIndexes([
+      { index_name: 'events_slug_key', column_name: 'slug', is_unique: 't', seq_in_index: '1', index_type: 'BTREE' } as any,
+      { INDEX_NAME: 'events_tenant_code_key', COLUMN_NAME: 'code', UNIQUE: true, COLUMN_POSITION: 2 } as any,
+      { INDEX_NAME: 'events_tenant_code_key', COLUMN_NAME: 'tenant_id', UNIQUE: true, COLUMN_POSITION: 1 } as any,
+      { indexName: 'events_ext_key', columnName: 'external_id', indexType: 'UNIQUE' } as any,
+      { index_name: 'idx_note', column_name: 'note', non_unique: '1' } as any,
+    ])).toEqual([
+      ['slug'],
+      ['tenant_id', 'code'],
+      ['external_id'],
     ]);
   });
 
@@ -141,6 +187,33 @@ describe('buildCopyInsertSQL', () => {
     });
   });
 
+  it('uses Oracle date constructors when all-column DELETE matching includes DATE values', () => {
+    const result = buildCopyDeleteSQL({
+      dbType: 'oracle',
+      tableName: 'LZJ.RIJIE_TABLE',
+      orderedCols: ['NAME', 'CREATED_AT', 'STATUS', 'MEMO'],
+      allTableColumns: ['NAME', 'CREATED_AT', 'STATUS', 'MEMO'],
+      record: {
+        NAME: '张三',
+        CREATED_AT: '2026-04-26T08:30:00+08:00',
+        STATUS: 'DONE',
+        MEMO: null,
+      },
+      columnTypesByLowerName: {
+        name: 'NVARCHAR2',
+        created_at: 'DATE',
+        status: 'VARCHAR2',
+        memo: 'VARCHAR2',
+      },
+    });
+
+    expect(result).toEqual({
+      ok: true,
+      whereStrategy: 'all-columns',
+      sql: `DELETE FROM "LZJ"."RIJIE_TABLE" WHERE ("NAME" = '张三' AND "CREATED_AT" = TO_DATE('2026-04-26 08:30:00', 'YYYY-MM-DD HH24:MI:SS') AND "STATUS" = 'DONE' AND "MEMO" IS NULL);`,
+    });
+  });
+
   it('refuses to build UPDATE/DELETE SQL when the result set lacks keys and does not cover all table columns', () => {
     const result = buildCopyDeleteSQL({
       dbType: 'mysql',
@@ -156,7 +229,49 @@ describe('buildCopyInsertSQL', () => {
     if (result.ok) {
       throw new Error('expected buildCopyDeleteSQL to fail');
     }
-    expect(result.error).toContain('主键');
-    expect(result.error).toContain('全部字段');
+    expect(result.error).toEqual({
+      key: 'data_grid.copy_sql.error.missing_safe_where',
+    });
+  });
+
+  it('returns a structured missing-table error with the raw SQL mode placeholder', () => {
+    const result = buildCopyUpdateSQL({
+      dbType: 'postgres',
+      tableName: '',
+      orderedCols: ['note'],
+      record: {
+        note: 'partial row',
+      },
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) {
+      throw new Error('expected buildCopyUpdateSQL to fail');
+    }
+    expect(result.error).toEqual({
+      key: 'data_grid.copy_sql.error.missing_table_name',
+      params: {
+        mode: 'UPDATE',
+      },
+    });
+  });
+
+  it('returns a structured no-copyable-fields error', () => {
+    const result = buildCopyDeleteSQL({
+      dbType: 'mysql',
+      tableName: 'orders',
+      orderedCols: [],
+      record: {
+        id: 7,
+      },
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) {
+      throw new Error('expected buildCopyDeleteSQL to fail');
+    }
+    expect(result.error).toEqual({
+      key: 'data_grid.copy_sql.error.no_copyable_fields',
+    });
   });
 });

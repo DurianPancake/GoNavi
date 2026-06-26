@@ -15,6 +15,7 @@ func TestClassifyMigrationDataModel(t *testing.T) {
 		"kingbase":   MigrationDataModelRelational,
 		"mongodb":    MigrationDataModelDocument,
 		"clickhouse": MigrationDataModelColumnar,
+		"starrocks":  MigrationDataModelColumnar,
 		"tdengine":   MigrationDataModelTimeSeries,
 		"redis":      MigrationDataModelKeyValue,
 		"custom":     MigrationDataModelCustom,
@@ -97,6 +98,91 @@ func TestResolveMigrationPlanner_UsesPGLikeMySQLPlannerForKingbaseToMySQL(t *tes
 		t.Fatalf("expected planner")
 	}
 	if planner.Name() != "pglike-mysql-planner" {
+		t.Fatalf("unexpected planner: %s", planner.Name())
+	}
+}
+
+func TestResolveMigrationPlanner_UsesMySQLMySQLPlannerForMySQLToMySQL(t *testing.T) {
+	t.Parallel()
+
+	planner := resolveMigrationPlanner(MigrationBuildContext{
+		Config: SyncConfig{
+			SourceConfig: connection.ConnectionConfig{Type: "mysql"},
+			TargetConfig: connection.ConnectionConfig{Type: "mysql"},
+		},
+	})
+	if planner == nil {
+		t.Fatalf("expected planner")
+	}
+	if planner.Name() != "mysql-mysql-planner" {
+		t.Fatalf("unexpected planner: %s", planner.Name())
+	}
+}
+
+func TestResolveMigrationPlanner_UsesPGLikePGLikePlannerForPostgresToKingbase(t *testing.T) {
+	t.Parallel()
+
+	planner := resolveMigrationPlanner(MigrationBuildContext{
+		Config: SyncConfig{
+			SourceConfig: connection.ConnectionConfig{Type: "postgres"},
+			TargetConfig: connection.ConnectionConfig{Type: "kingbase"},
+		},
+	})
+	if planner == nil {
+		t.Fatalf("expected planner")
+	}
+	if planner.Name() != "pglike-pglike-planner" {
+		t.Fatalf("unexpected planner: %s", planner.Name())
+	}
+}
+
+func TestResolveMigrationPlanner_DoesNotUsePGLikePGLikePlannerForPostgresToDuckDB(t *testing.T) {
+	t.Parallel()
+
+	planner := resolveMigrationPlanner(MigrationBuildContext{
+		Config: SyncConfig{
+			SourceConfig: connection.ConnectionConfig{Type: "postgres"},
+			TargetConfig: connection.ConnectionConfig{Type: "duckdb"},
+		},
+	})
+	if planner == nil {
+		t.Fatalf("expected planner")
+	}
+	if planner.Name() == "pglike-pglike-planner" {
+		t.Fatalf("duckdb should not use pglike same-family planner")
+	}
+}
+
+func TestResolveMigrationPlanner_UsesClickHouseClickHousePlanner(t *testing.T) {
+	t.Parallel()
+
+	planner := resolveMigrationPlanner(MigrationBuildContext{
+		Config: SyncConfig{
+			SourceConfig: connection.ConnectionConfig{Type: "clickhouse"},
+			TargetConfig: connection.ConnectionConfig{Type: "clickhouse"},
+		},
+	})
+	if planner == nil {
+		t.Fatalf("expected planner")
+	}
+	if planner.Name() != "clickhouse-clickhouse-planner" {
+		t.Fatalf("unexpected planner: %s", planner.Name())
+	}
+}
+
+func TestResolveMigrationPlanner_UsesMongoMongoPlanner(t *testing.T) {
+	t.Parallel()
+
+	planner := resolveMigrationPlanner(MigrationBuildContext{
+		Config: SyncConfig{
+			SourceConfig: connection.ConnectionConfig{Type: "mongodb"},
+			TargetConfig: connection.ConnectionConfig{Type: "mongodb"},
+		},
+	})
+	if planner == nil {
+		t.Fatalf("expected planner")
+	}
+	if planner.Name() != "mongo-mongo-planner" {
 		t.Fatalf("unexpected planner: %s", planner.Name())
 	}
 }

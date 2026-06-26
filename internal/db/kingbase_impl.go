@@ -5,9 +5,11 @@ package db
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"net"
-	"regexp"
+	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -17,7 +19,7 @@ import (
 	"GoNavi-Wails/internal/ssh"
 	"GoNavi-Wails/internal/utils"
 
-	_ "gitea.com/kingbase/gokb" // Registers "kingbase" driver
+	gokb "gitea.com/kingbase/gokb" // Registers "kingbase" driver
 )
 
 type KingbaseDB struct {
@@ -25,6 +27,13 @@ type KingbaseDB struct {
 	pingTimeout time.Duration
 	forwarder   *ssh.LocalForwarder // Store SSH tunnel forwarder
 }
+
+type kingbaseSessionExecer struct {
+	*sqlConnStatementExecer
+}
+
+var _ QueryMessageExecer = (*KingbaseDB)(nil)
+var _ StatementQueryMessageExecer = (*kingbaseSessionExecer)(nil)
 
 func quoteConnValue(v string) string {
 	if v == "" {
@@ -62,21 +71,43 @@ func (k *KingbaseDB) getDSN(config connection.ConnectionConfig) string {
 	// Kingbase DSN usually similar to Postgres:
 	// host=localhost port=54321 user=system password=... dbname=TEST sslmode=disable
 
-	address := config.Host
-	port := config.Port
+	params := url.Values{}
+	params.Set("host", config.Host)
+	params.Set("port", strconv.Itoa(config.Port))
+	params.Set("user", config.User)
+	params.Set("password", config.Password)
+	params.Set("dbname", config.Database)
+	params.Set("sslmode", resolvePostgresSSLMode(config))
+	applyPostgresSSLPathParams(params, config)
+	params.Set("connect_timeout", strconv.Itoa(getConnectTimeoutSeconds(config)))
+	mergeConnectionParamsFromConfigWithAllowlist(params, config, kingbaseConnectionParamNames, "kingbase")
 
-	// Construct DSN
-	dsn := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s connect_timeout=%d",
-		quoteConnValue(address),
-		port,
-		quoteConnValue(config.User),
-		quoteConnValue(config.Password),
-		quoteConnValue(config.Database),
-		quoteConnValue(resolvePostgresSSLMode(config)),
-		getConnectTimeoutSeconds(config),
-	)
+	preferred := []string{"host", "port", "user", "password", "dbname", "sslmode", "sslrootcert", "sslcert", "sslkey", "connect_timeout"}
+	seen := make(map[string]struct{}, len(params))
+	parts := make([]string, 0, len(params))
+	for _, key := range preferred {
+		if values, ok := params[key]; ok && len(values) > 0 {
+			parts = append(parts, fmt.Sprintf("%s=%s", key, quoteConnValue(values[len(values)-1])))
+			seen[key] = struct{}{}
+		}
+	}
+	extraKeys := make([]string, 0, len(params))
+	for key := range params {
+		if _, ok := seen[key]; ok || !isSafeConnectionParamKey(key) {
+			continue
+		}
+		extraKeys = append(extraKeys, key)
+	}
+	sort.Strings(extraKeys)
+	for _, key := range extraKeys {
+		values := params[key]
+		if len(values) == 0 {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s=%s", key, quoteConnValue(values[len(values)-1])))
+	}
 
-	return dsn
+	return strings.Join(parts, " ")
 }
 
 func (k *KingbaseDB) Connect(config connection.ConnectionConfig) error {
@@ -126,6 +157,7 @@ func (k *KingbaseDB) Connect(config connection.ConnectionConfig) error {
 			failures = append(failures, fmt.Sprintf("第%d次连接打开失败: %v", idx+1, err))
 			continue
 		}
+		configureSQLConnectionPool(db, "kingbase")
 		k.conn = db
 		k.pingTimeout = getConnectTimeout(attempt)
 		if err := k.Ping(); err != nil {
@@ -144,8 +176,9 @@ func (k *KingbaseDB) Connect(config connection.ConnectionConfig) error {
 			// 将 search_path 参数拼入 DSN
 			finalDSN := dsn + " search_path=" + quoteConnValue(searchPathStr)
 			if finalDB, err := sql.Open("kingbase", finalDSN); err == nil {
-				k.pingTimeout = getConnectTimeout(attempt)
+				configureSQLConnectionPool(finalDB, "kingbase")
 				finalDB.SetConnMaxLifetime(5 * time.Minute)
+				k.pingTimeout = getConnectTimeout(attempt)
 
 				// 临时将 k.conn 指向 finalDB 来做 ping 测试
 				oldConn := k.conn
@@ -188,7 +221,7 @@ func (k *KingbaseDB) getSearchPathStr() string {
 
 	query := `SELECT nspname FROM pg_namespace
 		WHERE nspname NOT IN ('pg_catalog', 'information_schema')
-		  AND nspname NOT LIKE 'pg_%'
+		  AND nspname NOT LIKE 'pg|_%' ESCAPE '|'
 		ORDER BY nspname`
 
 	rows, err := k.conn.Query(query)
@@ -257,6 +290,20 @@ func (k *KingbaseDB) QueryContext(ctx context.Context, query string) ([]map[stri
 	return scanRows(rows)
 }
 
+func (k *KingbaseDB) QueryContextWithMessages(ctx context.Context, query string) ([]map[string]interface{}, []string, []string, error) {
+	if k.conn == nil {
+		return nil, nil, nil, fmt.Errorf("连接未打开")
+	}
+
+	conn, err := k.conn.Conn(ctx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer conn.Close()
+
+	return queryKingbaseConnWithMessages(ctx, conn, query)
+}
+
 func (k *KingbaseDB) Query(query string) ([]map[string]interface{}, []string, error) {
 	if k.conn == nil {
 		return nil, nil, fmt.Errorf("连接未打开")
@@ -270,6 +317,10 @@ func (k *KingbaseDB) Query(query string) ([]map[string]interface{}, []string, er
 	return scanRows(rows)
 }
 
+func (k *KingbaseDB) QueryWithMessages(query string) ([]map[string]interface{}, []string, []string, error) {
+	return k.QueryContextWithMessages(context.Background(), query)
+}
+
 func (k *KingbaseDB) ExecContext(ctx context.Context, query string) (int64, error) {
 	if k.conn == nil {
 		return 0, fmt.Errorf("连接未打开")
@@ -279,6 +330,28 @@ func (k *KingbaseDB) ExecContext(ctx context.Context, query string) (int64, erro
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+func (k *KingbaseDB) ExecBatchContext(ctx context.Context, query string) (int64, error) {
+	if k.conn == nil {
+		return 0, fmt.Errorf("连接未打开")
+	}
+	res, err := k.conn.ExecContext(ctx, query)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (k *KingbaseDB) OpenSessionExecer(ctx context.Context) (StatementExecer, error) {
+	if k.conn == nil {
+		return nil, fmt.Errorf("连接未打开")
+	}
+	conn, err := k.conn.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &kingbaseSessionExecer{sqlConnStatementExecer: &sqlConnStatementExecer{conn: conn}}, nil
 }
 
 func (k *KingbaseDB) Exec(query string) (int64, error) {
@@ -292,19 +365,96 @@ func (k *KingbaseDB) Exec(query string) (int64, error) {
 	return res.RowsAffected()
 }
 
+func (e *kingbaseSessionExecer) QueryWithMessages(query string) ([]map[string]interface{}, []string, []string, error) {
+	return e.QueryContextWithMessages(context.Background(), query)
+}
+
+func (e *kingbaseSessionExecer) QueryContextWithMessages(ctx context.Context, query string) ([]map[string]interface{}, []string, []string, error) {
+	if e == nil || e.conn == nil {
+		return nil, nil, nil, fmt.Errorf("连接未打开")
+	}
+	return queryKingbaseConnWithMessages(ctx, e.conn, query)
+}
+
+func queryKingbaseConnWithMessages(ctx context.Context, conn *sql.Conn, query string) ([]map[string]interface{}, []string, []string, error) {
+	return querySQLConnWithTextNotices(ctx, conn, query, func(driverConn driver.Conn, addNotice func(string)) {
+		if addNotice == nil {
+			gokb.SetNoticeHandler(driverConn, nil)
+			return
+		}
+		gokb.SetNoticeHandler(driverConn, func(notice *gokb.Error) {
+			if notice != nil {
+				addNotice(notice.Message)
+			}
+		})
+	})
+}
+
 func (k *KingbaseDB) GetDatabases() ([]string, error) {
-	// Postgres/Kingbase style
 	data, _, err := k.Query("SELECT datname FROM pg_database WHERE datistemplate = false")
+	if err == nil {
+		dbs := collectKingbaseNames(data, "datname", "database")
+		if len(dbs) > 0 {
+			return dbs, nil
+		}
+	}
+
+	fallbackData, _, fallbackErr := k.Query("SELECT current_database() AS datname")
+	if fallbackErr != nil {
+		if err != nil {
+			return nil, err
+		}
+		return nil, fallbackErr
+	}
+
+	dbs := collectKingbaseNames(fallbackData, "datname", "database", "current_database", "currentDatabase")
+	if len(dbs) > 0 {
+		return dbs, nil
+	}
+
 	if err != nil {
 		return nil, err
 	}
-	var dbs []string
-	for _, row := range data {
-		if val, ok := row["datname"]; ok {
-			dbs = append(dbs, fmt.Sprintf("%v", val))
+	return nil, fmt.Errorf("未获取到可见数据库列表")
+}
+
+func collectKingbaseNames(rows []map[string]interface{}, keys ...string) []string {
+	result := make([]string, 0, len(rows))
+	seen := make(map[string]struct{}, len(rows))
+	for _, row := range rows {
+		name := strings.TrimSpace(getKingbaseNameFromRow(row, keys...))
+		if name == "" {
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+		result = append(result, name)
+	}
+	return result
+}
+
+func getKingbaseNameFromRow(row map[string]interface{}, keys ...string) string {
+	if len(row) == 0 {
+		return ""
+	}
+	for _, key := range keys {
+		if value, ok := row[key]; ok {
+			return fmt.Sprintf("%v", value)
 		}
 	}
-	return dbs, nil
+	for existingKey, value := range row {
+		for _, key := range keys {
+			if strings.EqualFold(existingKey, key) {
+				return fmt.Sprintf("%v", value)
+			}
+		}
+	}
+	for _, value := range row {
+		return fmt.Sprintf("%v", value)
+	}
+	return ""
 }
 
 func (k *KingbaseDB) GetTables(dbName string) ([]string, error) {
@@ -314,7 +464,7 @@ func (k *KingbaseDB) GetTables(dbName string) ([]string, error) {
 		FROM information_schema.tables
 		WHERE table_type = 'BASE TABLE'
 		  AND table_schema NOT IN ('pg_catalog', 'information_schema')
-		  AND table_schema NOT LIKE 'pg_%'
+		  AND table_schema NOT LIKE 'pg|_%' ESCAPE '|'
 		ORDER BY table_schema, table_name`
 
 	data, _, err := k.Query(query)
@@ -346,264 +496,31 @@ func (k *KingbaseDB) GetCreateStatement(dbName, tableName string) (string, error
 }
 
 func (k *KingbaseDB) GetColumns(dbName, tableName string) ([]connection.ColumnDefinition, error) {
-	// 解析 schema.table 格式
-	schema := strings.TrimSpace(dbName)
-	table := strings.TrimSpace(tableName)
-
-	// 如果 tableName 包含 schema (格式: schema.table)
-	if parts := strings.SplitN(table, ".", 2); len(parts) == 2 {
-		parsedSchema := strings.TrimSpace(parts[0])
-		parsedTable := strings.TrimSpace(parts[1])
-		if parsedSchema != "" && parsedTable != "" {
-			schema = parsedSchema
-			table = parsedTable
-		}
-	}
-
-	// 如果仍然没有 schema,使用 current_schema()
-	// 这样可以自动匹配当前连接的 search_path
-	if schema == "" {
-		return k.getColumnsWithCurrentSchema(table)
-	}
-
+	schema, table := normalizePGLikeMetadataTable(dbName, tableName)
 	if table == "" {
-		return nil, fmt.Errorf("表名不能为空")
+		return nil, localizedDatabaseRuntimeError("db.backend.error.table_name_required", nil)
 	}
 
-	// 转义函数:处理单引号,移除双引号
-	esc := func(s string) string {
-		// 移除前后的双引号(如果存在)
-		s = strings.Trim(s, "\"")
-		// 转义单引号
-		return strings.ReplaceAll(s, "'", "''")
-	}
-
-	query := fmt.Sprintf(`
-SELECT
-	a.attname AS column_name,
-	pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
-	CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable,
-	pg_get_expr(ad.adbin, ad.adrelid) AS column_default,
-	col_description(a.attrelid, a.attnum) AS comment,
-	CASE WHEN pk.attname IS NOT NULL THEN 'PRI' ELSE '' END AS column_key
-FROM pg_class c
-JOIN pg_namespace n ON n.oid = c.relnamespace
-JOIN pg_attribute a ON a.attrelid = c.oid
-LEFT JOIN pg_attrdef ad ON ad.adrelid = c.oid AND ad.adnum = a.attnum
-LEFT JOIN (
-	SELECT i.indrelid, a3.attname
-	FROM pg_index i
-	JOIN pg_attribute a3 ON a3.attrelid = i.indrelid AND a3.attnum = ANY(i.indkey)
-	WHERE i.indisprimary
-) pk ON pk.indrelid = c.oid AND pk.attname = a.attname
-WHERE c.relkind IN ('r', 'p')
-	AND n.nspname = '%s'
-	AND c.relname = '%s'
-	AND a.attnum > 0
-	AND NOT a.attisdropped
-ORDER BY a.attnum`, esc(schema), esc(table))
-
-	data, _, err := k.Query(query)
+	data, _, err := k.Query(buildPGLikeColumnsMetadataQuery(schema, table))
 	if err != nil {
 		return nil, err
 	}
 
-	var columns []connection.ColumnDefinition
-	for _, row := range data {
-		col := connection.ColumnDefinition{
-			Name:     fmt.Sprintf("%v", row["column_name"]),
-			Type:     fmt.Sprintf("%v", row["data_type"]),
-			Nullable: fmt.Sprintf("%v", row["is_nullable"]),
-			Key:      fmt.Sprintf("%v", row["column_key"]),
-			Extra:    "",
-			Comment:  "",
-		}
-
-		if row["column_default"] != nil {
-			def := fmt.Sprintf("%v", row["column_default"])
-			col.Default = &def
-			if strings.HasPrefix(strings.ToLower(strings.TrimSpace(def)), "nextval(") {
-				col.Extra = "auto_increment"
-			}
-		}
-
-		if v, ok := row["comment"]; ok && v != nil {
-			col.Comment = fmt.Sprintf("%v", v)
-		}
-
-		columns = append(columns, col)
-	}
-	return columns, nil
-}
-
-// getColumnsWithCurrentSchema 使用 current_schema() 查询当前schema的表
-func (k *KingbaseDB) getColumnsWithCurrentSchema(tableName string) ([]connection.ColumnDefinition, error) {
-	table := strings.TrimSpace(tableName)
-	if table == "" {
-		return nil, fmt.Errorf("表名不能为空")
-	}
-
-	// 转义函数
-	esc := func(s string) string {
-		s = strings.Trim(s, "\"")
-		return strings.ReplaceAll(s, "'", "''")
-	}
-
-	// 使用 current_schema() 获取当前schema
-	query := fmt.Sprintf(`
-SELECT
-	a.attname AS column_name,
-	pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
-	CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable,
-	pg_get_expr(ad.adbin, ad.adrelid) AS column_default,
-	col_description(a.attrelid, a.attnum) AS comment,
-	CASE WHEN pk.attname IS NOT NULL THEN 'PRI' ELSE '' END AS column_key
-FROM pg_class c
-JOIN pg_namespace n ON n.oid = c.relnamespace
-JOIN pg_attribute a ON a.attrelid = c.oid
-LEFT JOIN pg_attrdef ad ON ad.adrelid = c.oid AND ad.adnum = a.attnum
-LEFT JOIN (
-	SELECT i.indrelid, a3.attname
-	FROM pg_index i
-	JOIN pg_attribute a3 ON a3.attrelid = i.indrelid AND a3.attnum = ANY(i.indkey)
-	WHERE i.indisprimary
-) pk ON pk.indrelid = c.oid AND pk.attname = a.attname
-WHERE c.relkind IN ('r', 'p')
-	AND n.nspname = current_schema()
-	AND c.relname = '%s'
-	AND a.attnum > 0
-	AND NOT a.attisdropped
-ORDER BY a.attnum`, esc(table))
-
-	data, _, err := k.Query(query)
-	if err != nil {
-		return nil, err
-	}
-
-	var columns []connection.ColumnDefinition
-	for _, row := range data {
-		col := connection.ColumnDefinition{
-			Name:     fmt.Sprintf("%v", row["column_name"]),
-			Type:     fmt.Sprintf("%v", row["data_type"]),
-			Nullable: fmt.Sprintf("%v", row["is_nullable"]),
-			Key:      fmt.Sprintf("%v", row["column_key"]),
-			Extra:    "",
-			Comment:  "",
-		}
-
-		if row["column_default"] != nil {
-			def := fmt.Sprintf("%v", row["column_default"])
-			col.Default = &def
-			if strings.HasPrefix(strings.ToLower(strings.TrimSpace(def)), "nextval(") {
-				col.Extra = "auto_increment"
-			}
-		}
-
-		if v, ok := row["comment"]; ok && v != nil {
-			col.Comment = fmt.Sprintf("%v", v)
-		}
-
-		columns = append(columns, col)
-	}
-	return columns, nil
+	return buildPGLikeColumnDefinitions(data), nil
 }
 
 func (k *KingbaseDB) GetIndexes(dbName, tableName string) ([]connection.IndexDefinition, error) {
-	// 解析 schema.table 格式
-	schema := strings.TrimSpace(dbName)
-	table := strings.TrimSpace(tableName)
-
-	// 如果 tableName 包含 schema (格式: schema.table)
-	if parts := strings.SplitN(table, ".", 2); len(parts) == 2 {
-		parsedSchema := strings.TrimSpace(parts[0])
-		parsedTable := strings.TrimSpace(parts[1])
-		if parsedSchema != "" && parsedTable != "" {
-			schema = parsedSchema
-			table = parsedTable
-		}
-	}
-
+	schema, table := normalizePGLikeMetadataTable(dbName, tableName)
 	if table == "" {
-		return nil, fmt.Errorf("表名不能为空")
+		return nil, localizedDatabaseRuntimeError("db.backend.error.table_name_required", nil)
 	}
 
-	// 转义函数:处理单引号,移除双引号
-	esc := func(s string) string {
-		s = strings.Trim(s, "\"")
-		return strings.ReplaceAll(s, "'", "''")
-	}
-
-	// 构建查询：如果没有指定schema,使用current_schema()
-	var query string
-	if schema != "" {
-		query = fmt.Sprintf(`
-			SELECT
-				i.relname as index_name,
-				a.attname as column_name,
-				ix.indisunique as is_unique
-			FROM
-				pg_class t,
-				pg_class i,
-				pg_index ix,
-				pg_attribute a,
-				pg_namespace n
-			WHERE
-				t.oid = ix.indrelid
-				AND i.oid = ix.indexrelid
-				AND a.attrelid = t.oid
-				AND a.attnum = ANY(ix.indkey)
-				AND t.relkind = 'r'
-				AND t.relname = '%s'
-				AND n.oid = t.relnamespace
-				AND n.nspname = '%s'
-		`, esc(table), esc(schema))
-	} else {
-		query = fmt.Sprintf(`
-			SELECT
-				i.relname as index_name,
-				a.attname as column_name,
-				ix.indisunique as is_unique
-			FROM
-				pg_class t,
-				pg_class i,
-				pg_index ix,
-				pg_attribute a,
-				pg_namespace n
-			WHERE
-				t.oid = ix.indrelid
-				AND i.oid = ix.indexrelid
-				AND a.attrelid = t.oid
-				AND a.attnum = ANY(ix.indkey)
-				AND t.relkind = 'r'
-				AND t.relname = '%s'
-				AND n.oid = t.relnamespace
-				AND n.nspname = current_schema()
-		`, esc(table))
-	}
-
-	data, _, err := k.Query(query)
+	data, _, err := k.Query(buildPGLikeIndexesMetadataQuery(schema, table))
 	if err != nil {
 		return nil, err
 	}
 
-	var indexes []connection.IndexDefinition
-	for _, row := range data {
-		nonUnique := 1
-		if val, ok := row["is_unique"]; ok {
-			if b, ok := val.(bool); ok && b {
-				nonUnique = 0
-			}
-		}
-
-		idx := connection.IndexDefinition{
-			Name:       fmt.Sprintf("%v", row["index_name"]),
-			ColumnName: fmt.Sprintf("%v", row["column_name"]),
-			NonUnique:  nonUnique,
-			IndexType:  "BTREE", // Default
-		}
-		indexes = append(indexes, idx)
-	}
-	return indexes, nil
+	return buildPGLikeIndexDefinitions(data), nil
 }
 
 func (k *KingbaseDB) GetForeignKeys(dbName, tableName string) ([]connection.ForeignKeyDefinition, error) {
@@ -622,7 +539,7 @@ func (k *KingbaseDB) GetForeignKeys(dbName, tableName string) ([]connection.Fore
 	}
 
 	if table == "" {
-		return nil, fmt.Errorf("表名不能为空")
+		return nil, localizedDatabaseRuntimeError("db.backend.error.table_name_required", nil)
 	}
 
 	// 转义函数:处理单引号,移除双引号
@@ -704,7 +621,7 @@ func (k *KingbaseDB) GetTriggers(dbName, tableName string) ([]connection.Trigger
 	}
 
 	if table == "" {
-		return nil, fmt.Errorf("表名不能为空")
+		return nil, localizedDatabaseRuntimeError("db.backend.error.table_name_required", nil)
 	}
 
 	// 转义函数:处理单引号,移除双引号
@@ -758,7 +675,7 @@ func (k *KingbaseDB) ApplyChanges(tableName string, changes connection.ChangeSet
 
 	schema, table := splitKingbaseQualifiedTable(tableName)
 	if table == "" {
-		return fmt.Errorf("表名不能为空")
+		return localizedDatabaseRuntimeError("db.backend.error.table_name_required", nil)
 	}
 
 	qualifiedTable := ""
@@ -820,87 +737,21 @@ func (k *KingbaseDB) ApplyChanges(tableName string, changes connection.ChangeSet
 		}
 	}
 
-	// 3. Inserts
-	for _, row := range changes.Inserts {
-		var cols []string
-		var placeholders []string
-		var args []interface{}
-		idx := 0
-
-		for k, v := range row {
-			idx++
-			cols = append(cols, quoteKingbaseIdent(k))
-			placeholders = append(placeholders, fmt.Sprintf("$%d", idx))
-			args = append(args, v)
-		}
-
-		if len(cols) == 0 {
-			continue
-		}
-
-		query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", qualifiedTable, strings.Join(cols, ", "), strings.Join(placeholders, ", "))
-		if _, err := tx.Exec(query, args...); err != nil {
-			return fmt.Errorf("插入失败：%v; sql=%s", err, query)
-		}
+	if err := execParameterizedInsertBatches(parameterizedInsertConfig{
+		Table:       qualifiedTable,
+		Rows:        changes.Inserts,
+		QuoteColumn: quoteKingbaseIdent,
+		Placeholder: func(idx int) string {
+			return fmt.Sprintf("$%d", idx)
+		},
+		Exec: func(query string, args ...interface{}) (sql.Result, error) {
+			return tx.Exec(query, args...)
+		},
+	}); err != nil {
+		return err
 	}
 
 	return tx.Commit()
-}
-
-func normalizeKingbaseIdentifier(raw string) string {
-	return normalizeKingbaseIdentCommon(raw)
-}
-
-// kingbaseIdentNeedsQuote 判断标识符是否需要双引号包裹。
-// 与前端 sql.ts 中 needsQuote 逻辑保持一致。
-func kingbaseIdentNeedsQuote(ident string) bool {
-	if ident == "" {
-		return false
-	}
-	// 不是合法裸标识符格式（必须以字母或下划线开头，仅含字母、数字、下划线）
-	if matched, _ := regexp.MatchString(`^[a-zA-Z_][a-zA-Z0-9_]*$`, ident); !matched {
-		return true
-	}
-	// 包含大写字母时需要引号保护（KingbaseES/PostgreSQL 默认将未加引号的标识符折叠为小写）
-	for _, r := range ident {
-		if r >= 'A' && r <= 'Z' {
-			return true
-		}
-	}
-	// 是 SQL 保留字
-	return isKingbaseReservedWord(ident)
-}
-
-// isKingbaseReservedWord 检查是否为常见 SQL 保留字（简化版，与前端保持一致）。
-func isKingbaseReservedWord(ident string) bool {
-	switch strings.ToLower(ident) {
-	case "select", "from", "where", "table", "index", "user", "order", "group", "by",
-		"limit", "offset", "and", "or", "not", "null", "true", "false", "key",
-		"primary", "foreign", "references", "default", "constraint",
-		"create", "drop", "alter", "insert", "update", "delete", "set", "values", "into",
-		"join", "left", "right", "inner", "outer", "on", "as", "is", "in", "like",
-		"between", "case", "when", "then", "else", "end", "having", "distinct",
-		"all", "any", "exists", "union", "except", "intersect",
-		"column", "check", "unique", "with", "grant", "revoke", "trigger",
-		"begin", "commit", "rollback", "schema", "database", "view", "function",
-		"procedure", "sequence", "type", "domain", "role", "session", "current",
-		"authorization", "cross", "full", "natural", "some", "cast", "fetch",
-		"for", "to", "do", "if", "return", "returns", "declare", "cursor", "server", "owner":
-		return true
-	}
-	return false
-}
-
-func quoteKingbaseIdent(name string) string {
-	n := normalizeKingbaseIdentifier(name)
-	if n == "" {
-		return "\"\""
-	}
-	if !kingbaseIdentNeedsQuote(n) {
-		return n
-	}
-	n = strings.ReplaceAll(n, `"`, `""`)
-	return `"` + n + `"`
 }
 
 func splitKingbaseQualifiedTable(tableName string) (schema string, table string) {
@@ -910,11 +761,19 @@ func splitKingbaseQualifiedTable(tableName string) (schema string, table string)
 func (k *KingbaseDB) GetAllColumns(dbName string) ([]connection.ColumnDefinitionWithTable, error) {
 	// dbName 在本项目语义里是“数据库”，schema 由 table_schema 决定；这里返回全部用户 schema 的列用于查询提示。
 	query := `
-		SELECT table_schema, table_name, column_name, data_type
-		FROM information_schema.columns
-		WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
-		  AND table_schema NOT LIKE 'pg_%'
-		ORDER BY table_schema, table_name, ordinal_position`
+		SELECT
+			c.table_schema,
+			c.table_name,
+			c.column_name,
+			c.data_type,
+			col_description(cls.oid, a.attnum) AS comment
+		FROM information_schema.columns c
+		LEFT JOIN pg_namespace n ON n.nspname = c.table_schema
+		LEFT JOIN pg_class cls ON cls.relnamespace = n.oid AND cls.relname = c.table_name
+		LEFT JOIN pg_attribute a ON a.attrelid = cls.oid AND a.attname = c.column_name
+		WHERE c.table_schema NOT IN ('pg_catalog', 'information_schema')
+		  AND c.table_schema NOT LIKE 'pg|_%' ESCAPE '|'
+		ORDER BY c.table_schema, c.table_name, c.ordinal_position`
 
 	data, _, err := k.Query(query)
 	if err != nil {
@@ -933,6 +792,7 @@ func (k *KingbaseDB) GetAllColumns(dbName string) ([]connection.ColumnDefinition
 			TableName: tableName,
 			Name:      fmt.Sprintf("%v", row["column_name"]),
 			Type:      fmt.Sprintf("%v", row["data_type"]),
+			Comment:   fmt.Sprintf("%v", row["comment"]),
 		}
 		cols = append(cols, col)
 	}

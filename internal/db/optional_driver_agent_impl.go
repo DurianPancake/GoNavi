@@ -2,6 +2,7 @@ package db
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -23,8 +24,13 @@ import (
 const (
 	optionalAgentMethodConnect          = "connect"
 	optionalAgentMethodClose            = "close"
+	optionalAgentMethodMetadata         = "metadata"
 	optionalAgentMethodPing             = "ping"
+	optionalAgentMethodOpenSession      = "openSession"
+	optionalAgentMethodCloseSession     = "closeSession"
 	optionalAgentMethodQuery            = "query"
+	optionalAgentMethodQueryMulti       = "queryMulti"
+	optionalAgentMethodStreamQuery      = "streamQuery"
 	optionalAgentMethodExec             = "exec"
 	optionalAgentMethodGetDatabases     = "getDatabases"
 	optionalAgentMethodGetTables        = "getTables"
@@ -36,11 +42,26 @@ const (
 	optionalAgentMethodGetTriggers      = "getTriggers"
 	optionalAgentMethodApplyChanges     = "applyChanges"
 	optionalAgentDefaultScannerMaxBytes = 8 << 20
+	optionalAgentMetadataProbeTimeout   = 5 * time.Second
+	// callStreamQueryGCInterval 控制 callStreamQuery 每接收多少行 driver-agent 数据触发一次 runtime.GC。
+	//
+	// 该路径不走 sql.Rows（scan_rows.go 的周期 GC 覆盖不到），但每个 chunk 解码
+	// [][]interface{} + normalizeQueryValue 转换会产生大量临时字符串，需要主动回收。
+	// 取 50000 与 scan_rows.go 的 streamRowsPeriodicGCInterval 保持一致，
+	// 让两端在相近节奏下分别 GC，避免内存峰值叠加。
+	callStreamQueryGCInterval = 50000
+)
+
+const (
+	optionalAgentChunkColumns = "columns"
+	optionalAgentChunkRows    = "rows"
+	optionalAgentChunkDone    = "done"
 )
 
 type optionalAgentRequest struct {
 	ID        int64                        `json:"id"`
 	Method    string                       `json:"method"`
+	SessionID string                       `json:"sessionId,omitempty"`
 	Config    *connection.ConnectionConfig `json:"config,omitempty"`
 	Query     string                       `json:"query,omitempty"`
 	TimeoutMs int64                        `json:"timeoutMs,omitempty"`
@@ -55,7 +76,15 @@ type optionalAgentResponse struct {
 	Error        string          `json:"error,omitempty"`
 	Data         json.RawMessage `json:"data,omitempty"`
 	Fields       []string        `json:"fields,omitempty"`
+	Messages     []string        `json:"messages,omitempty"`
+	ChunkType    string          `json:"chunkType,omitempty"`
 	RowsAffected int64           `json:"rowsAffected,omitempty"`
+}
+
+type OptionalDriverAgentMetadata struct {
+	DriverType     string `json:"driverType,omitempty"`
+	AgentRevision  string `json:"agentRevision,omitempty"`
+	ProtocolSchema string `json:"protocolSchema,omitempty"`
 }
 
 type optionalDriverAgentClient struct {
@@ -67,6 +96,25 @@ type optionalDriverAgentClient struct {
 	stderrMu sync.Mutex
 	stderr   strings.Builder
 	driver   string
+}
+
+func ProbeOptionalDriverAgentMetadata(driverType string, executablePath string) (OptionalDriverAgentMetadata, error) {
+	client, err := newOptionalDriverAgentClient(driverType, executablePath)
+	if err != nil {
+		return OptionalDriverAgentMetadata{}, err
+	}
+	defer func() {
+		_ = client.close()
+	}()
+
+	var metadata OptionalDriverAgentMetadata
+	if err := client.callWithTimeout(optionalAgentRequest{Method: optionalAgentMethodMetadata}, &metadata, nil, nil, nil, optionalAgentMetadataProbeTimeout); err != nil {
+		return OptionalDriverAgentMetadata{}, err
+	}
+	metadata.DriverType = normalizeRuntimeDriverType(metadata.DriverType)
+	metadata.AgentRevision = strings.TrimSpace(metadata.AgentRevision)
+	metadata.ProtocolSchema = strings.TrimSpace(metadata.ProtocolSchema)
+	return metadata, nil
 }
 
 func newOptionalDriverAgentClient(driverType string, executablePath string) (*optionalDriverAgentClient, error) {
@@ -162,7 +210,7 @@ func (c *optionalDriverAgentClient) stderrText() string {
 	return strings.TrimSpace(c.stderr.String())
 }
 
-func (c *optionalDriverAgentClient) call(req optionalAgentRequest, out interface{}, fields *[]string, rowsAffected *int64) error {
+func (c *optionalDriverAgentClient) call(req optionalAgentRequest, out interface{}, fields *[]string, messages *[]string, rowsAffected *int64) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -206,6 +254,9 @@ func (c *optionalDriverAgentClient) call(req optionalAgentRequest, out interface
 	if fields != nil {
 		*fields = resp.Fields
 	}
+	if messages != nil {
+		*messages = append((*messages)[:0], resp.Messages...)
+	}
 	if rowsAffected != nil {
 		*rowsAffected = resp.RowsAffected
 	}
@@ -215,6 +266,156 @@ func (c *optionalDriverAgentClient) call(req optionalAgentRequest, out interface
 		}
 	}
 	return nil
+}
+
+func (c *optionalDriverAgentClient) callWithTimeout(req optionalAgentRequest, out interface{}, fields *[]string, messages *[]string, rowsAffected *int64, timeout time.Duration) error {
+	if timeout <= 0 {
+		return c.call(req, out, fields, messages, rowsAffected)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- c.call(req, out, fields, messages, rowsAffected)
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-timer.C:
+		c.forceTerminate()
+		return fmt.Errorf("%s 驱动代理 metadata 探测超时（%s），请确认导入的是正确的 driver-agent 可执行文件", driverDisplayName(c.driver), timeout)
+	}
+}
+
+func (c *optionalDriverAgentClient) callStreamQuery(req optionalAgentRequest, consumer QueryStreamConsumer) error {
+	if consumer == nil {
+		return fmt.Errorf("query stream consumer required")
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.nextID++
+	req.ID = c.nextID
+
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+	payload = append(payload, '\n')
+	if _, err := c.stdin.Write(payload); err != nil {
+		stderrText := c.stderrText()
+		if stderrText == "" {
+			return fmt.Errorf("调用 %s 驱动代理失败：%w", driverDisplayName(c.driver), err)
+		}
+		return fmt.Errorf("调用 %s 驱动代理失败：%w（stderr: %s）", driverDisplayName(c.driver), err, stderrText)
+	}
+
+	var columns []string
+	valueConsumer, useValueConsumer := consumer.(QueryStreamValueConsumer)
+
+	// processedRows 用于周期性触发 GC。
+	// 该路径不走 sql.Rows，scan_rows.go 的周期 GC 覆盖不到。
+	// 每个 chunk 解码会分配 [][]interface{} + normalizeQueryValue 转换副本，
+	// 88W 行场景下不主动 GC 会让主进程 RSS 单调爬升。
+	var processedRows int64
+
+	for {
+		line, err := c.reader.ReadBytes('\n')
+		if err != nil {
+			stderrText := c.stderrText()
+			if stderrText == "" {
+				return fmt.Errorf("读取 %s 驱动代理响应失败：%w", driverDisplayName(c.driver), err)
+			}
+			return fmt.Errorf("读取 %s 驱动代理响应失败：%w（stderr: %s）", driverDisplayName(c.driver), err, stderrText)
+		}
+
+		var resp optionalAgentResponse
+		if err := json.Unmarshal(line, &resp); err != nil {
+			return fmt.Errorf("解析 %s 驱动代理响应失败：%w", driverDisplayName(c.driver), err)
+		}
+		if !resp.Success {
+			errText := strings.TrimSpace(resp.Error)
+			if errText == "" {
+				errText = fmt.Sprintf("%s 驱动代理返回失败", driverDisplayName(c.driver))
+			}
+			return errors.New(errText)
+		}
+
+		switch resp.ChunkType {
+		case optionalAgentChunkColumns:
+			columns = append(columns[:0], resp.Fields...)
+			if err := consumer.SetColumns(columns); err != nil {
+				return err
+			}
+		case optionalAgentChunkRows:
+			if len(columns) == 0 {
+				return fmt.Errorf("%s 驱动代理流式响应缺少列信息", driverDisplayName(c.driver))
+			}
+			rows, err := decodeOptionalAgentRowValueBatch(resp.Data)
+			if err != nil {
+				return fmt.Errorf("解析 %s 驱动代理流式数据失败：%w", driverDisplayName(c.driver), err)
+			}
+			for _, row := range rows {
+				if useValueConsumer {
+					if err := valueConsumer.ConsumeRowValues(row); err != nil {
+						return err
+					}
+					continue
+				}
+				entry := make(map[string]interface{}, len(columns))
+				for i, column := range columns {
+					if i < len(row) {
+						entry[column] = row[i]
+					} else {
+						entry[column] = nil
+					}
+				}
+				if err := consumer.ConsumeRow(entry); err != nil {
+					return err
+				}
+			}
+			processedRows += int64(len(rows))
+			if processedRows >= callStreamQueryGCInterval {
+				runtime.GC()
+				processedRows = 0
+			}
+		case optionalAgentChunkDone:
+			return nil
+		default:
+			return fmt.Errorf("%s 驱动代理返回未知流式分片类型：%s", driverDisplayName(c.driver), strings.TrimSpace(resp.ChunkType))
+		}
+	}
+}
+
+func decodeOptionalAgentRowValueBatch(data []byte) ([][]interface{}, error) {
+	if len(data) == 0 {
+		return nil, nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	var rows [][]interface{}
+	if err := decoder.Decode(&rows); err != nil {
+		return nil, err
+	}
+	for rowIdx := range rows {
+		for colIdx := range rows[rowIdx] {
+			rows[rowIdx][colIdx] = normalizeQueryValue(rows[rowIdx][colIdx])
+		}
+	}
+	return rows, nil
+}
+
+func (c *optionalDriverAgentClient) forceTerminate() {
+	if c.stdin != nil {
+		_ = c.stdin.Close()
+	}
+	if c.cmd != nil && c.cmd.Process != nil {
+		_ = c.cmd.Process.Kill()
+	}
 }
 
 func (c *optionalDriverAgentClient) close() error {
@@ -238,6 +439,14 @@ func (c *optionalDriverAgentClient) close() error {
 type OptionalDriverAgentDB struct {
 	driverType string
 	client     *optionalDriverAgentClient
+}
+
+type optionalDriverAgentSession struct {
+	client    *optionalDriverAgentClient
+	driver    string
+	sessionID string
+	mu        sync.Mutex
+	closed    bool
 }
 
 func newOptionalDriverAgentDatabase(driverType string) databaseFactory {
@@ -265,7 +474,7 @@ func (d *OptionalDriverAgentDB) Connect(config connection.ConnectionConfig) erro
 	if err := client.call(optionalAgentRequest{
 		Method: optionalAgentMethodConnect,
 		Config: &config,
-	}, nil, nil, nil); err != nil {
+	}, nil, nil, nil, nil); err != nil {
 		_ = client.close()
 		return err
 	}
@@ -278,7 +487,7 @@ func (d *OptionalDriverAgentDB) Close() error {
 	if d.client == nil {
 		return nil
 	}
-	_ = d.client.call(optionalAgentRequest{Method: optionalAgentMethodClose}, nil, nil, nil)
+	_ = d.client.call(optionalAgentRequest{Method: optionalAgentMethodClose}, nil, nil, nil, nil)
 	err := d.client.close()
 	d.client = nil
 	return err
@@ -289,10 +498,87 @@ func (d *OptionalDriverAgentDB) Ping() error {
 	if err != nil {
 		return err
 	}
-	return client.call(optionalAgentRequest{Method: optionalAgentMethodPing}, nil, nil, nil)
+	return client.call(optionalAgentRequest{Method: optionalAgentMethodPing}, nil, nil, nil, nil)
 }
 
 func (d *OptionalDriverAgentDB) QueryContext(ctx context.Context, query string) ([]map[string]interface{}, []string, error) {
+	data, fields, _, err := d.QueryContextWithMessages(ctx, query)
+	return data, fields, err
+}
+
+func (d *OptionalDriverAgentDB) QueryContextWithMessages(ctx context.Context, query string) ([]map[string]interface{}, []string, []string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, nil, err
+	}
+	client, err := d.requireClient()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	var data []map[string]interface{}
+	var fields []string
+	var messages []string
+	if err := client.call(optionalAgentRequest{
+		Method:    optionalAgentMethodQuery,
+		Query:     query,
+		TimeoutMs: timeoutMsFromContext(ctx),
+	}, &data, &fields, &messages, nil); err != nil {
+		return nil, nil, nil, err
+	}
+	return data, fields, messages, nil
+}
+
+func (d *OptionalDriverAgentDB) Query(query string) ([]map[string]interface{}, []string, error) {
+	data, fields, _, err := d.QueryWithMessages(query)
+	return data, fields, err
+}
+
+func (d *OptionalDriverAgentDB) QueryWithMessages(query string) ([]map[string]interface{}, []string, []string, error) {
+	client, err := d.requireClient()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	var data []map[string]interface{}
+	var fields []string
+	var messages []string
+	if err := client.call(optionalAgentRequest{
+		Method: optionalAgentMethodQuery,
+		Query:  query,
+	}, &data, &fields, &messages, nil); err != nil {
+		return nil, nil, nil, err
+	}
+	return data, fields, messages, nil
+}
+
+func (d *OptionalDriverAgentDB) QueryMulti(query string) ([]connection.ResultSetData, error) {
+	results, _, err := d.QueryMultiWithMessages(query)
+	return results, err
+}
+
+func (d *OptionalDriverAgentDB) QueryMultiWithMessages(query string) ([]connection.ResultSetData, []string, error) {
+	client, err := d.requireClient()
+	if err != nil {
+		return nil, nil, err
+	}
+	var results []connection.ResultSetData
+	var messages []string
+	if err := client.call(optionalAgentRequest{
+		Method: optionalAgentMethodQueryMulti,
+		Query:  query,
+	}, &results, nil, &messages, nil); err != nil {
+		if isOptionalAgentMultiResultUnsupportedError(err) {
+			return nil, nil, nil
+		}
+		return nil, nil, err
+	}
+	return results, messages, nil
+}
+
+func (d *OptionalDriverAgentDB) QueryMultiContext(ctx context.Context, query string) ([]connection.ResultSetData, error) {
+	results, _, err := d.QueryMultiContextWithMessages(ctx, query)
+	return results, err
+}
+
+func (d *OptionalDriverAgentDB) QueryMultiContextWithMessages(ctx context.Context, query string) ([]connection.ResultSetData, []string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
@@ -300,32 +586,55 @@ func (d *OptionalDriverAgentDB) QueryContext(ctx context.Context, query string) 
 	if err != nil {
 		return nil, nil, err
 	}
-	var data []map[string]interface{}
-	var fields []string
+	var results []connection.ResultSetData
+	var messages []string
 	if err := client.call(optionalAgentRequest{
-		Method:    optionalAgentMethodQuery,
+		Method:    optionalAgentMethodQueryMulti,
 		Query:     query,
 		TimeoutMs: timeoutMsFromContext(ctx),
-	}, &data, &fields, nil); err != nil {
+	}, &results, nil, &messages, nil); err != nil {
+		if isOptionalAgentMultiResultUnsupportedError(err) {
+			return nil, nil, nil
+		}
 		return nil, nil, err
 	}
-	return data, fields, nil
+	return results, messages, nil
 }
 
-func (d *OptionalDriverAgentDB) Query(query string) ([]map[string]interface{}, []string, error) {
+func (d *OptionalDriverAgentDB) StreamQuery(query string, consumer QueryStreamConsumer) error {
+	return d.StreamQueryContext(context.Background(), query, consumer)
+}
+
+func (d *OptionalDriverAgentDB) StreamQueryContext(ctx context.Context, query string, consumer QueryStreamConsumer) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	client, err := d.requireClient()
 	if err != nil {
-		return nil, nil, err
+		return err
 	}
-	var data []map[string]interface{}
-	var fields []string
-	if err := client.call(optionalAgentRequest{
-		Method: optionalAgentMethodQuery,
-		Query:  query,
-	}, &data, &fields, nil); err != nil {
-		return nil, nil, err
+	err = client.callStreamQuery(optionalAgentRequest{
+		Method:    optionalAgentMethodStreamQuery,
+		Query:     query,
+		TimeoutMs: timeoutMsFromContext(ctx),
+	}, consumer)
+	if isOptionalAgentStreamUnsupportedError(err) {
+		logger.Warnf("%s 驱动代理暂不支持流式查询，回退到缓冲模式：err=%v", driverDisplayName(d.driverType), err)
+		data, columns, queryErr := d.QueryContext(ctx, query)
+		if queryErr != nil {
+			return queryErr
+		}
+		if err := consumer.SetColumns(columns); err != nil {
+			return err
+		}
+		for _, row := range data {
+			if err := consumer.ConsumeRow(row); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
-	return data, fields, nil
+	return err
 }
 
 func (d *OptionalDriverAgentDB) ExecContext(ctx context.Context, query string) (int64, error) {
@@ -341,7 +650,7 @@ func (d *OptionalDriverAgentDB) ExecContext(ctx context.Context, query string) (
 		Method:    optionalAgentMethodExec,
 		Query:     query,
 		TimeoutMs: timeoutMsFromContext(ctx),
-	}, nil, nil, &affected); err != nil {
+	}, nil, nil, nil, &affected); err != nil {
 		return 0, err
 	}
 	return affected, nil
@@ -356,10 +665,171 @@ func (d *OptionalDriverAgentDB) Exec(query string) (int64, error) {
 	if err := client.call(optionalAgentRequest{
 		Method: optionalAgentMethodExec,
 		Query:  query,
-	}, nil, nil, &affected); err != nil {
+	}, nil, nil, nil, &affected); err != nil {
 		return 0, err
 	}
 	return affected, nil
+}
+
+func (d *OptionalDriverAgentDB) OpenSessionExecer(ctx context.Context) (StatementExecer, error) {
+	client, err := d.requireClient()
+	if err != nil {
+		return nil, err
+	}
+	var sessionID string
+	if err := client.call(optionalAgentRequest{
+		Method:    optionalAgentMethodOpenSession,
+		TimeoutMs: timeoutMsFromContext(ctx),
+	}, &sessionID, nil, nil, nil); err != nil {
+		return nil, err
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil, fmt.Errorf("%s 驱动代理未返回事务会话 ID", driverDisplayName(d.driverType))
+	}
+	return &optionalDriverAgentSession{
+		client:    client,
+		driver:    d.driverType,
+		sessionID: sessionID,
+	}, nil
+}
+
+func (s *optionalDriverAgentSession) Query(query string) ([]map[string]interface{}, []string, error) {
+	return s.QueryContext(context.Background(), query)
+}
+
+func (s *optionalDriverAgentSession) QueryWithMessages(query string) ([]map[string]interface{}, []string, []string, error) {
+	return s.QueryContextWithMessages(context.Background(), query)
+}
+
+func (s *optionalDriverAgentSession) StreamQuery(query string, consumer QueryStreamConsumer) error {
+	return s.StreamQueryContext(context.Background(), query, consumer)
+}
+
+func (s *optionalDriverAgentSession) StreamQueryContext(ctx context.Context, query string, consumer QueryStreamConsumer) error {
+	if err := s.ensureOpen(); err != nil {
+		return err
+	}
+	err := s.client.callStreamQuery(optionalAgentRequest{
+		Method:    optionalAgentMethodStreamQuery,
+		SessionID: s.sessionID,
+		Query:     query,
+		TimeoutMs: timeoutMsFromContext(ctx),
+	}, consumer)
+	if isOptionalAgentStreamUnsupportedError(err) {
+		logger.Warnf("%s 驱动代理事务会话暂不支持流式查询，回退到缓冲模式：err=%v", driverDisplayName(s.driver), err)
+		data, columns, queryErr := s.QueryContext(ctx, query)
+		if queryErr != nil {
+			return queryErr
+		}
+		if err := consumer.SetColumns(columns); err != nil {
+			return err
+		}
+		for _, row := range data {
+			if err := consumer.ConsumeRow(row); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return err
+}
+
+func (s *optionalDriverAgentSession) QueryContext(ctx context.Context, query string) ([]map[string]interface{}, []string, error) {
+	data, fields, _, err := s.QueryContextWithMessages(ctx, query)
+	return data, fields, err
+}
+
+func (s *optionalDriverAgentSession) QueryContextWithMessages(ctx context.Context, query string) ([]map[string]interface{}, []string, []string, error) {
+	if err := s.ensureOpen(); err != nil {
+		return nil, nil, nil, err
+	}
+	var data []map[string]interface{}
+	var fields []string
+	var messages []string
+	if err := s.client.call(optionalAgentRequest{
+		Method:    optionalAgentMethodQuery,
+		SessionID: s.sessionID,
+		Query:     query,
+		TimeoutMs: timeoutMsFromContext(ctx),
+	}, &data, &fields, &messages, nil); err != nil {
+		return nil, nil, nil, err
+	}
+	return data, fields, messages, nil
+}
+
+func (s *optionalDriverAgentSession) Exec(query string) (int64, error) {
+	return s.ExecContext(context.Background(), query)
+}
+
+func (s *optionalDriverAgentSession) ExecContext(ctx context.Context, query string) (int64, error) {
+	if err := s.ensureOpen(); err != nil {
+		return 0, err
+	}
+	var affected int64
+	if err := s.client.call(optionalAgentRequest{
+		Method:    optionalAgentMethodExec,
+		SessionID: s.sessionID,
+		Query:     query,
+		TimeoutMs: timeoutMsFromContext(ctx),
+	}, nil, nil, nil, &affected); err != nil {
+		return 0, err
+	}
+	return affected, nil
+}
+
+func (s *optionalDriverAgentSession) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
+	sessionID := s.sessionID
+	s.mu.Unlock()
+	return s.client.call(optionalAgentRequest{
+		Method:    optionalAgentMethodCloseSession,
+		SessionID: sessionID,
+	}, nil, nil, nil, nil)
+}
+
+func (s *optionalDriverAgentSession) ensureOpen() error {
+	if s == nil || s.client == nil {
+		return fmt.Errorf("连接未打开")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || strings.TrimSpace(s.sessionID) == "" {
+		return fmt.Errorf("%s 事务会话已关闭", driverDisplayName(s.driver))
+	}
+	return nil
+}
+
+func isOptionalAgentStreamUnsupportedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.TrimSpace(err.Error())
+	if text == "" {
+		return false
+	}
+	return strings.Contains(text, "不支持的方法") || strings.Contains(text, "不支持流式查询")
+}
+
+func isOptionalAgentMultiResultUnsupportedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.TrimSpace(err.Error())
+	if text == "" {
+		return false
+	}
+	return strings.Contains(text, "不支持的方法") ||
+		strings.Contains(text, "不支持原生多结果集查询") ||
+		strings.Contains(text, "不支持多结果集查询")
 }
 
 func (d *OptionalDriverAgentDB) GetDatabases() ([]string, error) {
@@ -370,7 +840,7 @@ func (d *OptionalDriverAgentDB) GetDatabases() ([]string, error) {
 	var dbs []string
 	if err := client.call(optionalAgentRequest{
 		Method: optionalAgentMethodGetDatabases,
-	}, &dbs, nil, nil); err != nil {
+	}, &dbs, nil, nil, nil); err != nil {
 		return nil, err
 	}
 	return dbs, nil
@@ -385,7 +855,7 @@ func (d *OptionalDriverAgentDB) GetTables(dbName string) ([]string, error) {
 	if err := client.call(optionalAgentRequest{
 		Method: optionalAgentMethodGetTables,
 		DBName: dbName,
-	}, &tables, nil, nil); err != nil {
+	}, &tables, nil, nil, nil); err != nil {
 		return nil, err
 	}
 	return tables, nil
@@ -401,7 +871,7 @@ func (d *OptionalDriverAgentDB) GetCreateStatement(dbName, tableName string) (st
 		Method:    optionalAgentMethodGetCreateStmt,
 		DBName:    dbName,
 		TableName: tableName,
-	}, &sqlText, nil, nil); err != nil {
+	}, &sqlText, nil, nil, nil); err != nil {
 		return "", err
 	}
 	return sqlText, nil
@@ -417,7 +887,7 @@ func (d *OptionalDriverAgentDB) GetColumns(dbName, tableName string) ([]connecti
 		Method:    optionalAgentMethodGetColumns,
 		DBName:    dbName,
 		TableName: tableName,
-	}, &columns, nil, nil); err != nil {
+	}, &columns, nil, nil, nil); err != nil {
 		return nil, err
 	}
 	return columns, nil
@@ -432,7 +902,7 @@ func (d *OptionalDriverAgentDB) GetAllColumns(dbName string) ([]connection.Colum
 	if err := client.call(optionalAgentRequest{
 		Method: optionalAgentMethodGetAllColumns,
 		DBName: dbName,
-	}, &columns, nil, nil); err != nil {
+	}, &columns, nil, nil, nil); err != nil {
 		return nil, err
 	}
 	return columns, nil
@@ -448,7 +918,7 @@ func (d *OptionalDriverAgentDB) GetIndexes(dbName, tableName string) ([]connecti
 		Method:    optionalAgentMethodGetIndexes,
 		DBName:    dbName,
 		TableName: tableName,
-	}, &indexes, nil, nil); err != nil {
+	}, &indexes, nil, nil, nil); err != nil {
 		return nil, err
 	}
 	return indexes, nil
@@ -464,7 +934,7 @@ func (d *OptionalDriverAgentDB) GetForeignKeys(dbName, tableName string) ([]conn
 		Method:    optionalAgentMethodGetForeignKeys,
 		DBName:    dbName,
 		TableName: tableName,
-	}, &keys, nil, nil); err != nil {
+	}, &keys, nil, nil, nil); err != nil {
 		return nil, err
 	}
 	return keys, nil
@@ -480,7 +950,7 @@ func (d *OptionalDriverAgentDB) GetTriggers(dbName, tableName string) ([]connect
 		Method:    optionalAgentMethodGetTriggers,
 		DBName:    dbName,
 		TableName: tableName,
-	}, &triggers, nil, nil); err != nil {
+	}, &triggers, nil, nil, nil); err != nil {
 		return nil, err
 	}
 	return triggers, nil
@@ -505,7 +975,7 @@ func (d *OptionalDriverAgentDB) ApplyChanges(tableName string, changes connectio
 		Method:    optionalAgentMethodApplyChanges,
 		TableName: tableName,
 		Changes:   &changes,
-	}, nil, nil, nil)
+	}, nil, nil, nil, nil)
 }
 
 func (d *OptionalDriverAgentDB) requireClient() (*optionalDriverAgentClient, error) {
@@ -550,7 +1020,7 @@ func (d *OptionalDriverAgentDB) ensureKingbaseSearchPath(config connection.Conne
 func (d *OptionalDriverAgentDB) listKingbaseSchemas(ctx context.Context) ([]string, error) {
 	query := `SELECT nspname FROM pg_namespace
 		WHERE nspname NOT IN ('pg_catalog', 'information_schema')
-		  AND nspname NOT LIKE 'pg_%'
+		  AND nspname NOT LIKE 'pg|_%' ESCAPE '|'
 		ORDER BY nspname`
 	rows, _, err := d.QueryContext(ctx, query)
 	if err != nil {

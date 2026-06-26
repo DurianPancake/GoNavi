@@ -1,7 +1,7 @@
 # IDE
 .idea/
 *.iml
-
+.gitignore
 # build / release artifacts
 frontend/release/
 **/release/
@@ -10,16 +10,20 @@ build/bin/
 
 # wails / node artifacts (按需)
 node_modules/
+frontend/wailsjs/tsconfig.json
 
 dist/
 .DS_Store
 .gemini-clipboard
 GoNavi-Wails
 GoNavi-Wails.exe
+optional-driver-agent
+optional-driver-agent.exe
 .ace-tool/
 .superpowers/
 .claude/
 .gemini/
+.playwright-mcp/
 **/tmpclaude-*
 docs/superpowers/
 docs/需求追踪/
@@ -28,3 +32,4 @@ CLAUDE.md
 **/CLAUDE.md
 .worktrees
 docs
+.tmp_superpowers_edit

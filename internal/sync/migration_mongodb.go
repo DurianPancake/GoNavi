@@ -30,23 +30,25 @@ func buildTabularToMongoPlan(config SyncConfig, tableName string, sourceDB db.Da
 	plan := SchemaMigrationPlan{}
 	sourceType := resolveMigrationDBType(config.SourceConfig)
 	targetType := resolveMigrationDBType(config.TargetConfig)
-	plan.SourceSchema, plan.SourceTable = normalizeSchemaAndTable(sourceType, config.SourceConfig.Database, tableName)
-	plan.TargetSchema, plan.TargetTable = normalizeSchemaAndTable(targetType, config.TargetConfig.Database, tableName)
+	plan.SourceSchema, plan.SourceTable = normalizeSyncSourceSchemaAndTable(config, tableName)
+	plan.TargetSchema, plan.TargetTable = normalizeSyncTargetSchemaAndTable(config, tableName)
 	plan.SourceQueryTable = qualifiedNameForQuery(sourceType, plan.SourceSchema, plan.SourceTable, tableName)
 	plan.TargetQueryTable = qualifiedNameForQuery(targetType, plan.TargetSchema, plan.TargetTable, tableName)
 	plan.PlannedAction = "使用已有目标集合导入"
 
 	sourceCols, sourceExists, err := inspectTableColumns(sourceDB, plan.SourceSchema, plan.SourceTable)
 	if err != nil {
-		return plan, nil, nil, fmt.Errorf("获取源表字段失败: %w", err)
+		return plan, nil, nil, syncWrapDetailError("data_sync.backend.error.source_table_columns_failed", err)
 	}
 	if !sourceExists {
-		return plan, nil, nil, fmt.Errorf("源表不存在或无列定义: %s", tableName)
+		return plan, nil, nil, syncTextError("data_sync.backend.error.source_table_missing_or_no_columns", map[string]any{
+			"table": tableName,
+		})
 	}
 
 	targetExists, err := inspectMongoCollection(targetDB, plan.TargetSchema, plan.TargetTable)
 	if err != nil {
-		return plan, sourceCols, nil, fmt.Errorf("检查目标集合失败: %w", err)
+		return plan, sourceCols, nil, syncWrapDetailError("data_sync.backend.error.target_collection_check_failed", err)
 	}
 	plan.TargetTableExists = targetExists
 
@@ -87,10 +89,77 @@ func buildTabularToMongoPlan(config SyncConfig, tableName string, sourceDB db.Da
 	}
 }
 
+func buildMongoToMongoPlan(config SyncConfig, tableName string, sourceDB db.Database, targetDB db.Database) (SchemaMigrationPlan, []connection.ColumnDefinition, []connection.ColumnDefinition, error) {
+	plan := SchemaMigrationPlan{}
+	sourceType := resolveMigrationDBType(config.SourceConfig)
+	targetType := resolveMigrationDBType(config.TargetConfig)
+	plan.SourceSchema, plan.SourceTable = normalizeSyncSourceSchemaAndTable(config, tableName)
+	plan.TargetSchema, plan.TargetTable = normalizeSyncTargetSchemaAndTable(config, tableName)
+	plan.SourceQueryTable = qualifiedNameForQuery(sourceType, plan.SourceSchema, plan.SourceTable, tableName)
+	plan.TargetQueryTable = qualifiedNameForQuery(targetType, plan.TargetSchema, plan.TargetTable, tableName)
+	plan.PlannedAction = "使用已有目标集合导入"
+
+	sourceCols, warnings, err := inferMongoCollectionColumns(sourceDB, plan.SourceTable)
+	if err != nil {
+		return plan, nil, nil, err
+	}
+	plan.Warnings = append(plan.Warnings, warnings...)
+	if len(sourceCols) == 0 {
+		return plan, nil, nil, syncTextError("data_sync.backend.error.source_collection_no_migratable_fields", map[string]any{
+			"collection": tableName,
+		})
+	}
+
+	targetExists, err := inspectMongoCollection(targetDB, plan.TargetSchema, plan.TargetTable)
+	if err != nil {
+		return plan, sourceCols, nil, syncWrapDetailError("data_sync.backend.error.target_collection_check_failed", err)
+	}
+	plan.TargetTableExists = targetExists
+
+	strategy := normalizeTargetTableStrategy(config.TargetTableStrategy)
+	if targetExists {
+		plan.Warnings = append(plan.Warnings, "MongoDB 为弱 schema 目标，字段结构以写入文档为准，不执行目标列校验")
+		if strategy != "existing_only" {
+			plan.Warnings = append(plan.Warnings, "目标集合已存在，当前仅执行数据导入；不会自动重建已有索引")
+		}
+		return dedupeSchemaMigrationPlan(plan), sourceCols, nil, nil
+	}
+
+	switch strategy {
+	case "existing_only":
+		plan.PlannedAction = "目标集合不存在，需先手工创建"
+		plan.Warnings = append(plan.Warnings, "当前策略要求目标集合已存在，执行时不会自动创建")
+		return dedupeSchemaMigrationPlan(plan), sourceCols, nil, nil
+	case "smart", "auto_create_if_missing":
+		plan.AutoCreate = true
+		plan.PlannedAction = "目标集合不存在，将自动创建集合后导入"
+		createCmd, err := buildMongoCreateCollectionCommand(plan.TargetTable)
+		if err != nil {
+			return plan, sourceCols, nil, err
+		}
+		plan.PreDataSQL = append(plan.PreDataSQL, createCmd)
+		if config.CreateIndexes {
+			indexCmds, indexWarnings, unsupported, created, skipped, err := buildMongoIndexCommands(sourceDB, plan.SourceSchema, plan.SourceTable, plan.TargetTable)
+			if err != nil {
+				plan.Warnings = append(plan.Warnings, fmt.Sprintf("读取源集合索引失败，已跳过索引迁移：%v", err))
+			} else {
+				plan.PostDataSQL = append(plan.PostDataSQL, indexCmds...)
+				plan.Warnings = append(plan.Warnings, indexWarnings...)
+				plan.UnsupportedObjects = append(plan.UnsupportedObjects, unsupported...)
+				plan.IndexesToCreate = created
+				plan.IndexesSkipped = skipped
+			}
+		}
+		return dedupeSchemaMigrationPlan(plan), sourceCols, nil, nil
+	default:
+		return dedupeSchemaMigrationPlan(plan), sourceCols, nil, nil
+	}
+}
+
 func buildMongoToMySQLPlan(config SyncConfig, tableName string, sourceDB db.Database, targetDB db.Database) (SchemaMigrationPlan, []connection.ColumnDefinition, []connection.ColumnDefinition, error) {
 	plan := SchemaMigrationPlan{}
-	plan.SourceSchema, plan.SourceTable = normalizeSchemaAndTable(config.SourceConfig.Type, config.SourceConfig.Database, tableName)
-	plan.TargetSchema, plan.TargetTable = normalizeSchemaAndTable(config.TargetConfig.Type, config.TargetConfig.Database, tableName)
+	plan.SourceSchema, plan.SourceTable = normalizeSyncSourceSchemaAndTable(config, tableName)
+	plan.TargetSchema, plan.TargetTable = normalizeSyncTargetSchemaAndTable(config, tableName)
 	plan.SourceQueryTable = qualifiedNameForQuery(config.SourceConfig.Type, plan.SourceSchema, plan.SourceTable, tableName)
 	plan.TargetQueryTable = qualifiedNameForQuery(config.TargetConfig.Type, plan.TargetSchema, plan.TargetTable, tableName)
 	plan.PlannedAction = "使用已有目标表导入"
@@ -101,12 +170,14 @@ func buildMongoToMySQLPlan(config SyncConfig, tableName string, sourceDB db.Data
 	}
 	plan.Warnings = append(plan.Warnings, warnings...)
 	if len(sourceCols) == 0 {
-		return plan, nil, nil, fmt.Errorf("源集合未推断出可迁移字段: %s", tableName)
+		return plan, nil, nil, syncTextError("data_sync.backend.error.source_collection_no_migratable_fields", map[string]any{
+			"collection": tableName,
+		})
 	}
 
 	targetCols, targetExists, err := inspectTableColumns(targetDB, plan.TargetSchema, plan.TargetTable)
 	if err != nil {
-		return plan, sourceCols, nil, fmt.Errorf("获取目标表字段失败: %w", err)
+		return plan, sourceCols, nil, syncWrapDetailError("data_sync.backend.error.target_table_columns_failed", err)
 	}
 	plan.TargetTableExists = targetExists
 
@@ -232,7 +303,7 @@ func inferMongoCollectionColumns(sourceDB db.Database, collection string) ([]con
 	query := fmt.Sprintf(`{"find":"%s","filter":{},"limit":200}`, strings.TrimSpace(collection))
 	rows, _, err := sourceDB.Query(query)
 	if err != nil {
-		return nil, nil, fmt.Errorf("读取源集合样本失败: %w", err)
+		return nil, nil, syncWrapDetailError("data_sync.backend.error.mongo_read_source_samples_failed", err)
 	}
 	if len(rows) == 0 {
 		return []connection.ColumnDefinition{{Name: "_id", Type: "varchar(64)", Nullable: "NO", Key: "PRI"}}, []string{"源集合暂无样本数据，仅按 `_id` 生成基础主键列"}, nil
@@ -432,8 +503,8 @@ func moveStringToFront(items []string, target string) []string {
 func buildMongoToPGLikePlan(config SyncConfig, tableName string, sourceDB db.Database, targetDB db.Database) (SchemaMigrationPlan, []connection.ColumnDefinition, []connection.ColumnDefinition, error) {
 	plan := SchemaMigrationPlan{}
 	targetType := strings.ToLower(strings.TrimSpace(config.TargetConfig.Type))
-	plan.SourceSchema, plan.SourceTable = normalizeSchemaAndTable(config.SourceConfig.Type, config.SourceConfig.Database, tableName)
-	plan.TargetSchema, plan.TargetTable = normalizeSchemaAndTable(config.TargetConfig.Type, config.TargetConfig.Database, tableName)
+	plan.SourceSchema, plan.SourceTable = normalizeSyncSourceSchemaAndTable(config, tableName)
+	plan.TargetSchema, plan.TargetTable = normalizeSyncTargetSchemaAndTable(config, tableName)
 	plan.SourceQueryTable = qualifiedNameForQuery(config.SourceConfig.Type, plan.SourceSchema, plan.SourceTable, tableName)
 	plan.TargetQueryTable = qualifiedNameForQuery(config.TargetConfig.Type, plan.TargetSchema, plan.TargetTable, tableName)
 	plan.PlannedAction = "使用已有目标表导入"
@@ -444,12 +515,14 @@ func buildMongoToPGLikePlan(config SyncConfig, tableName string, sourceDB db.Dat
 	}
 	plan.Warnings = append(plan.Warnings, warnings...)
 	if len(sourceCols) == 0 {
-		return plan, nil, nil, fmt.Errorf("源集合未推断出可迁移字段: %s", tableName)
+		return plan, nil, nil, syncTextError("data_sync.backend.error.source_collection_no_migratable_fields", map[string]any{
+			"collection": tableName,
+		})
 	}
 
 	targetCols, targetExists, err := inspectTableColumns(targetDB, plan.TargetSchema, plan.TargetTable)
 	if err != nil {
-		return plan, sourceCols, nil, fmt.Errorf("获取目标表字段失败: %w", err)
+		return plan, sourceCols, nil, syncWrapDetailError("data_sync.backend.error.target_table_columns_failed", err)
 	}
 	plan.TargetTableExists = targetExists
 

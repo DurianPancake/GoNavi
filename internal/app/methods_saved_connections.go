@@ -1,17 +1,42 @@
 package app
 
-import "GoNavi-Wails/internal/connection"
+import (
+	"strings"
+
+	"GoNavi-Wails/internal/connection"
+)
 
 func (a *App) savedConnectionRepository() *savedConnectionRepository {
 	return newSavedConnectionRepository(a.configDir, a.secretStore)
 }
 
 func (a *App) GetSavedConnections() ([]connection.SavedConnectionView, error) {
-	return a.savedConnectionRepository().List()
+	items, err := a.savedConnectionRepository().List()
+	if err != nil {
+		return nil, err
+	}
+	return sanitizeSavedConnectionViews(items), nil
+}
+
+func (a *App) GetEditableSavedConnection(id string) (connection.SavedConnectionView, error) {
+	view, err := a.savedConnectionRepository().Find(id)
+	if err != nil {
+		return connection.SavedConnectionView{}, err
+	}
+	resolvedConfig, err := a.resolveConnectionSecrets(view.Config)
+	if err != nil {
+		return connection.SavedConnectionView{}, err
+	}
+	view.Config = resolvedConfig
+	return view, nil
 }
 
 func (a *App) SaveConnection(input connection.SavedConnectionInput) (connection.SavedConnectionView, error) {
-	return a.savedConnectionRepository().Save(input)
+	view, err := a.savedConnectionRepository().Save(input)
+	if err != nil {
+		return connection.SavedConnectionView{}, err
+	}
+	return sanitizeSavedConnectionView(view), nil
 }
 
 func (a *App) DeleteConnection(id string) error {
@@ -19,20 +44,37 @@ func (a *App) DeleteConnection(id string) error {
 }
 
 func (a *App) DuplicateConnection(id string) (connection.SavedConnectionView, error) {
-	return a.savedConnectionRepository().Duplicate(id)
+	view, err := a.savedConnectionRepository().Duplicate(
+		id,
+		a.appText("connection.unnamed", nil),
+		a.appText("connection.copy_suffix", nil),
+	)
+	if err != nil {
+		return connection.SavedConnectionView{}, err
+	}
+	return sanitizeSavedConnectionView(view), nil
 }
 
 func (a *App) ImportLegacyConnections(items []connection.LegacySavedConnection) ([]connection.SavedConnectionView, error) {
-	result := make([]connection.SavedConnectionView, 0, len(items))
-	repo := a.savedConnectionRepository()
+	inputs := make([]connection.SavedConnectionInput, 0, len(items))
 	for _, item := range items {
-		view, err := repo.Save(connection.SavedConnectionInput(item))
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, view)
+		input := connection.SavedConnectionInput(item)
+		input.ClearPrimaryPassword = strings.TrimSpace(item.Config.Password) == ""
+		input.ClearSSHPassword = strings.TrimSpace(item.Config.SSH.Password) == ""
+		input.ClearProxyPassword = strings.TrimSpace(item.Config.Proxy.Password) == ""
+		input.ClearHTTPTunnelPassword = strings.TrimSpace(item.Config.HTTPTunnel.Password) == ""
+		input.ClearMySQLReplicaPassword = strings.TrimSpace(item.Config.MySQLReplicaPassword) == ""
+		input.ClearMongoReplicaPassword = strings.TrimSpace(item.Config.MongoReplicaPassword) == ""
+		input.ClearRedisSentinelPassword = strings.TrimSpace(item.Config.RedisSentinelPassword) == ""
+		input.ClearOpaqueURI = strings.TrimSpace(item.Config.URI) == ""
+		input.ClearOpaqueDSN = strings.TrimSpace(item.Config.DSN) == ""
+		inputs = append(inputs, input)
 	}
-	return result, nil
+	views, err := a.importSavedConnectionsAtomically(inputs)
+	if err != nil {
+		return nil, err
+	}
+	return sanitizeSavedConnectionViews(views), nil
 }
 
 func (a *App) SaveGlobalProxy(input connection.SaveGlobalProxyInput) (connection.GlobalProxyView, error) {
